@@ -18,20 +18,6 @@ This library provides a React-friendly WASM binding around a standards-based HPK
 
 The implementation uses **HPKE Base mode** (no sender authentication, no PSK). Each `encryptFields` call performs one HPKE `setup_sender` to create a single session context, then seals every field under that context in deterministic field-name order. The field name is bound as AAD, so ciphertexts cannot be replayed across fields.
 
-## Project Structure
-
-```
-kem-dem-js/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs      # WASM bindings & React-facing API
-│   ├── kem.rs      # HPKE wrapper (X25519 + AES-256-GCM + HKDF-SHA256)
-│   └── error.rs    # Error types
-├── pkg/            # Generated WASM package (not committed)
-└── examples/
-    └── react-demo/ # Sample React application
-```
-
 ## Installation
 
 ### Prerequisites
@@ -137,4 +123,4 @@ npm run build
 
 ## License
 
-MIT OR Apache-2.0
+MIT
