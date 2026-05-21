@@ -534,10 +534,16 @@ impl ZkEncryptor {
             payload.push(parse_fr_be(&s).map_err(js_err)?);
         }
 
-        let mut seed = [0u8; 32];
-        getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
-
-        Ok(zk_kemdem_encrypt(seed, &receiver_pub, &payload))
+        // Retry loop: if the CSPRNG seed reduces to the zero scalar
+        // (probability ~1/2^251), re-draw and try again.
+        loop {
+            let mut seed = [0u8; 32];
+            getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
+            match zk_kemdem_encrypt(seed, &receiver_pub, &payload) {
+                Ok(ct) => return Ok(ct),
+                Err(_) => continue, // zero scalar — re-draw
+            }
+        }
     }
 
     /// Decrypt a ciphertext produced by [`encrypt`].
@@ -578,10 +584,16 @@ impl ZkEncryptor {
         use crate::kemdem_functions::generate_keypair_from_seed;
         use ark_ff::PrimeField;
 
-        let mut seed = [0u8; 32];
-        getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
-
-        let (sk, pk) = generate_keypair_from_seed(seed);
+        // Retry loop: if the CSPRNG seed reduces to the zero scalar
+        // (probability ~1/2^251), re-draw and try again.
+        let (sk, pk) = loop {
+            let mut seed = [0u8; 32];
+            getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
+            match generate_keypair_from_seed(seed) {
+                Ok(pair) => break pair,
+                Err(_) => continue, // zero scalar — re-draw
+            }
+        };
 
         let sk_bytes = {
             use ark_ff::BigInteger;

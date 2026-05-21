@@ -49,15 +49,16 @@ pub const EPHEM_ELEMS: usize = 2;
 /// mod the BabyJubJub scalar field to produce the ephemeral scalar `r`.
 /// Callers MUST sample `random_seed` from a CSPRNG and never reuse it.
 ///
-/// Returns a hex-encoded ciphertext.
+/// Returns a hex-encoded ciphertext, or an error if the seed reduces
+/// to the zero scalar (callers should retry with a fresh CSPRNG sample).
 pub fn zk_kemdem_encrypt(
     random_seed: [u8; 32],
     receiver_pub_key: &EdwardsAffine,
     payload: &[Fr254],
-) -> String {
-    let mut r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
+) -> Result<String, String> {
+    let r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
     if r.is_zero() {
-        r = BabyJubJubScalar::from(1u64);
+        return Err("ephemeral scalar is zero; retry with fresh randomness".to_string());
     }
     let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
     let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
@@ -71,7 +72,7 @@ pub fn zk_kemdem_encrypt(
     elements.push(ephemeral_pub.x);
     elements.push(ephemeral_pub.y);
 
-    encode_elements_le_hex(&elements)
+    Ok(encode_elements_le_hex(&elements))
 }
 
 /// Decrypt a hex-encoded ciphertext using `receiver_sec_key`.
@@ -162,13 +163,18 @@ fn decode_elements_le_hex(ciphertext_hex: &str) -> Result<Vec<Fr254>, String> {
 // ─── BabyJubJub keypair helpers, used by the WASM facade ──────────
 
 /// Generate a BabyJubJub keypair from a CSPRNG seed.
-pub fn generate_keypair_from_seed(seed: [u8; 32]) -> (BabyJubJubScalar, EdwardsAffine) {
-    let mut sk = BabyJubJubScalar::from_le_bytes_mod_order(&seed);
+///
+/// Returns an error if the seed reduces to the zero scalar (callers
+/// should retry with a fresh CSPRNG sample).
+pub fn generate_keypair_from_seed(
+    seed: [u8; 32],
+) -> Result<(BabyJubJubScalar, EdwardsAffine), String> {
+    let sk = BabyJubJubScalar::from_le_bytes_mod_order(&seed);
     if sk.is_zero() {
-        sk = BabyJubJubScalar::from(1u64);
+        return Err("derived scalar is zero; retry with fresh randomness".to_string());
     }
     let pk = (EdwardsProjective::generator() * sk).into_affine();
-    (sk, pk)
+    Ok((sk, pk))
 }
 
 /// Reconstruct an `EdwardsAffine` from its raw `(x, y)` Fr254 coordinates
@@ -213,7 +219,7 @@ mod tests {
         let mut seed = [0u8; 32];
         ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
 
-        let ct = zk_kemdem_encrypt(seed, &pk, &payload);
+        let ct = zk_kemdem_encrypt(seed, &pk, &payload).unwrap();
         // Expected size: 1 payload + 2 ephem = 3 elements = 96 bytes = 192 hex chars
         assert_eq!(ct.len(), (1 + EPHEM_ELEMS) * FR_BYTES * 2);
 
@@ -228,7 +234,7 @@ mod tests {
         let mut seed = [0u8; 32];
         ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
 
-        let ct = zk_kemdem_encrypt(seed, &pk, &payload);
+        let ct = zk_kemdem_encrypt(seed, &pk, &payload).unwrap();
         let pt = zk_kemdem_decrypt(&sk, &ct).unwrap();
         assert_eq!(pt, payload);
     }
@@ -242,7 +248,7 @@ mod tests {
         let mut seed = [0u8; 32];
         ark_std::rand::RngCore::fill_bytes(&mut rng, &mut seed);
 
-        let ct = zk_kemdem_encrypt(seed, &pk, &payload);
+        let ct = zk_kemdem_encrypt(seed, &pk, &payload).unwrap();
         let wrong = zk_kemdem_decrypt(&other_sk, &ct).unwrap();
         assert_ne!(wrong, payload);
     }

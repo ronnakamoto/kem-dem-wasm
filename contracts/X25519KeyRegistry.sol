@@ -76,6 +76,7 @@ contract X25519KeyRegistry {
     // ─── Errors ──────────────────────────────────────────────────
 
     error EmptyKey();
+    error InvalidVersion();
     error VersionExists();
     error VersionRevoked();
     error UnknownVersion();
@@ -227,6 +228,7 @@ contract X25519KeyRegistry {
     // ─── Internal write ──────────────────────────────────────────
 
     function _write(address account, uint32 version, bytes32 pubkey) internal {
+        if (version == 0) revert InvalidVersion();
         if (pubkey == bytes32(0)) revert EmptyKey();
 
         Record storage existing = _records[account][version];
