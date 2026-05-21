@@ -167,7 +167,7 @@ contract X25519KeyRegistry {
         // Consume the nonce *before* the write so a re‑entrant
         // callback (via ERC‑1271 staticcall — disallowed but defence
         // in depth) cannot land twice.
-        unchecked { registrationNonce[account] = nonce + 1; }
+        registrationNonce[account] = nonce + 1;
 
         _write(account, version, pubkey);
     }

@@ -42,6 +42,9 @@ use taceo_ark_babyjubjub::{EdwardsAffine, EdwardsProjective, Fr as BabyJubJubSca
 pub const FR_BYTES: usize = 32;
 /// Number of trailing Fr elements that encode the ephemeral public key.
 pub const EPHEM_ELEMS: usize = 2;
+/// Maximum number of payload elements per encryption to bound memory
+/// and computation (each element requires a Poseidon hash invocation).
+pub const MAX_PAYLOAD_ELEMS: usize = 1024;
 
 /// Encrypt `payload` (a slice of Fr elements) to `receiver_pub_key`.
 ///
@@ -56,6 +59,12 @@ pub fn zk_kemdem_encrypt(
     receiver_pub_key: &EdwardsAffine,
     payload: &[Fr254],
 ) -> Result<String, String> {
+    if payload.len() > MAX_PAYLOAD_ELEMS {
+        return Err(format!(
+            "payload too large: {} elements exceeds maximum of {MAX_PAYLOAD_ELEMS}",
+            payload.len()
+        ));
+    }
     let r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
     if r.is_zero() {
         return Err("ephemeral scalar is zero; retry with fresh randomness".to_string());

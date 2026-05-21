@@ -284,8 +284,7 @@ impl EncryptedPackage {
             &obj,
             &JsValue::from_str("kemCiphertext"),
             &self.kem_ciphertext(),
-        )
-        .unwrap();
+        )?;
 
         let fields = js_sys::Object::new();
         for (name, value) in &self.encrypted_fields {
@@ -293,10 +292,9 @@ impl EncryptedPackage {
                 &fields,
                 &JsValue::from_str(name),
                 &Uint8Array::from(&value[..]),
-            )
-            .unwrap();
+            )?;
         }
-        js_sys::Reflect::set(&obj, &JsValue::from_str("encryptedFields"), &fields).unwrap();
+        js_sys::Reflect::set(&obj, &JsValue::from_str("encryptedFields"), &fields)?;
 
         Ok(obj.into())
     }
@@ -538,10 +536,14 @@ impl ZkEncryptor {
         // (probability ~1/2^251), re-draw and try again.
         loop {
             let mut seed = [0u8; 32];
-            getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
+            {
+                use rand::{rngs::StdRng, RngCore, SeedableRng};
+                StdRng::from_os_rng().fill_bytes(&mut seed);
+            }
             match zk_kemdem_encrypt(seed, &receiver_pub, &payload) {
                 Ok(ct) => return Ok(ct),
-                Err(_) => continue, // zero scalar — re-draw
+                Err(e) if e.contains("retry") => continue, // zero scalar — re-draw
+                Err(e) => return Err(js_err(e)),           // real error (e.g. payload too large)
             }
         }
     }
@@ -588,7 +590,10 @@ impl ZkEncryptor {
         // (probability ~1/2^251), re-draw and try again.
         let (sk, pk) = loop {
             let mut seed = [0u8; 32];
-            getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
+            {
+                use rand::{rngs::StdRng, RngCore, SeedableRng};
+                StdRng::from_os_rng().fill_bytes(&mut seed);
+            }
             match generate_keypair_from_seed(seed) {
                 Ok(pair) => break pair,
                 Err(_) => continue, // zero scalar — re-draw
