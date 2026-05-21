@@ -79,7 +79,10 @@ mod tests {
     #[test]
     fn crypto_error_from_hpke_error() {
         let err = CryptoError::from(hpke::HpkeError::ValidationError);
-        assert_eq!(err.message(), "HPKE operation failed: Input value is invalid");
+        assert_eq!(
+            err.message(),
+            "HPKE operation failed: Input value is invalid"
+        );
     }
 
     #[test]

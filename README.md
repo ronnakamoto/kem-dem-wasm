@@ -1,10 +1,16 @@
 # kem-dem-wasm
 
-A production-grade WebAssembly package for hybrid public-key encryption in React, implementing the **HPKE** standard ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html)) with flexible per-field encryption.
+A production-grade WebAssembly package for hybrid public-key encryption in React, implementing:
+
+- **HPKE** ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html)) — standard hybrid encryption with per-field sealing
+- **ZK-friendly KEM-DEM** — BabyJubJub-based encryption over BN254 `Fr` field elements for zero-knowledge circuit integration
 
 ## Overview
 
-This library provides a React-friendly WASM binding around a standards-based HPKE implementation. It encrypts arbitrary JavaScript objects field-by-field under a single HPKE session, binding each field name as authenticated associated data (AAD) to prevent cross-field ciphertext replay.
+This library provides React-friendly WASM bindings for two complementary encryption systems:
+
+1. **HPKE mode** — encrypts arbitrary JavaScript objects field-by-field under a single HPKE session, binding each field name as authenticated associated data (AAD) to prevent cross-field ciphertext replay.
+2. **ZK mode** — encrypts payloads of BN254 scalar field (`Fr`) elements using a BabyJubJub KEM-DEM construction, producing ciphertexts that can be efficiently processed inside SNARK/STARK circuits.
 
 ## Architecture
 
@@ -20,11 +26,16 @@ The implementation uses **HPKE Base mode** (no sender authentication, no PSK). E
 
 ## Installation
 
+```bash
+npm install kem-dem-wasm
+```
+
+*(Optional)* If you wish to build the package from source:
+
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (latest stable)
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/)
-- Node.js 18+ (for the example app)
 
 ### Build the WASM Package
 
@@ -93,6 +104,112 @@ const blob = kemDem.encrypt(kp.publicKey, new TextEncoder().encode('secret data'
 const decrypted = kemDem.decrypt(kp.secretKey, blob)
 ```
 
+### Ethereum Wallet Integration
+
+Derive a deterministic X25519 encryption keypair from an Ethereum wallet seed phrase, so users don't need to manage a separate encryption key.
+
+#### Option A: BIP-32 Derivation (software wallets with seed access)
+
+```javascript
+import { HDNodeWallet, getBytes } from 'ethers'
+
+// The library exposes the canonical BIP-44 path for encryption keys
+const path = KemDem.encryptionDerivationPath()  // "m/44'/60'/0'/2147483647'/0"
+
+// Derive the child private key directly at the encryption path
+const node = HDNodeWallet.fromPhrase(mnemonic, "", path)
+const ikm  = getBytes(node.privateKey)           // 32 bytes
+const addr = getBytes(signerAddress)             // 20 bytes
+
+const kp = kemDem.deriveKeypairFromIkm(ikm, addr)
+// kp.publicKey  → Uint8Array (32 bytes, publish on-chain)
+// kp.secretKey  → Uint8Array (32 bytes, keep local)
+```
+
+#### Option B: Sign-to-Derive (MetaMask / EIP-1193 wallets)
+
+```javascript
+// One-time signature prompt (EIP-712 typed data when available; falls back to personal_sign)
+const chainId = Number(BigInt(await provider.request({ method: 'eth_chainId' })))
+const path = KemDem.encryptionDerivationPath()
+const typedData = {
+  types: {
+    EIP712Domain: [
+      { name: 'name', type: 'string' },
+      { name: 'version', type: 'string' },
+      { name: 'chainId', type: 'uint256' },
+    ],
+    KemDemDerive: [
+      { name: 'action', type: 'string' },
+      { name: 'path', type: 'string' },
+    ],
+  },
+  primaryType: 'KemDemDerive',
+  domain: { name: 'kem-dem-wasm', version: '1', chainId },
+  message: { action: 'derive-encryption-key', path },
+}
+let sigHex
+try {
+  sigHex = await provider.request({
+    method: 'eth_signTypedData_v4',
+    params: [signerAddress, JSON.stringify(typedData)],
+  })
+} catch {
+  sigHex = await provider.request({
+    method: 'personal_sign',
+    params: ['kem-dem-wasm/v1/derive-encryption-key', signerAddress],
+  })
+}
+const sig  = getBytes(sigHex)                    // 65 bytes
+const addr = getBytes(signerAddress)             // 20 bytes
+
+const kp = kemDem.deriveKeypairFromSignature(sig, addr)
+```
+
+> **Security note**: The derived secret key is exposed to the JS garbage collector once returned to the browser. Never persist it in cleartext — cache in memory for the session only, or encrypt at rest with a user passphrase.
+
+> **Hardware wallet note**: Hardware wallets (Ledger, Trezor) cannot natively derive X25519 keys. Use Option B (sign-to-derive) for hardware wallet users. The encryption secret key will live in software on the host.
+
+### On-chain Key Registry
+
+Once a user has derived their X25519 public key, they need a way to **publish it** so that other parties can encrypt to them just from their EVM address. The repo ships a minimal Solidity registry at [`contracts/X25519KeyRegistry.sol`](contracts/X25519KeyRegistry.sol).
+
+**Design**:
+
+* `bytes32 pubkey` per `(account, version)` — X25519 keys are exactly 32 B and pack into one storage slot.
+* `register(uint32 version, bytes32 pubkey)` — EOA self-registration (`msg.sender == account`).
+* `registerFor(account, version, pubkey, deadline, sig)` — EIP-712 typed-data path for contract / 4337 / meta-tx accounts. Per-account `registrationNonce` makes every signature single-use (replay-after-revoke is blocked).
+* `revoke(version)` — marks a version permanently dead. Cannot be re-registered — caller must use a fresh version number to rotate.
+* `getLatest(account)` / `get(account, version)` / `isRegistered(account, version)` — sender-side lookups.
+* ECDSA path enforces low-s (EIP-2) and rejects `address(0)`. ERC-1271 path supported automatically for contract accounts.
+
+**Sender flow**:
+
+```javascript
+import { Contract, getBytes, hexlify } from 'ethers'
+
+const registry = new Contract(REGISTRY_ADDR, REGISTRY_ABI, provider)
+const record   = await registry.getLatest(recipientAddress)
+const pubKey   = getBytes(record.pubkey)              // 32 B X25519 pubkey
+
+const pkg = kemDem.encryptFields(pubKey, { ssn: '...' })
+// post pkg anywhere (IPFS, calldata, off-chain DB)
+```
+
+**Recipient publish flow** (EOA):
+
+```javascript
+const kp = kemDem.deriveKeypairFromIkm(ikm, addr)
+const pubkeyHex = hexlify(kp.publicKey)               // 32 B → bytes32
+
+const registry = new Contract(REGISTRY_ADDR, REGISTRY_ABI, signer)
+await registry.register(1, pubkeyHex)                 // version 1
+```
+
+To rotate, derive a v2 keypair (e.g. via a `v2` info string) and call `registry.register(2, newPubkeyHex)`. Senders calling `getLatest` automatically pick up the new version.
+
+> **Deployment**: the contract is non-upgradeable on purpose. New derivation schemes get a new contract address; the `SCHEMA` constant (`keccak256("kem-dem-wasm/v1/x25519-pubkey")`) makes the wire format self-describing.
+
 ## Security Properties
 
 1. **Standardized KEM-DEM**: Uses HPKE (RFC 9180) instead of a custom construction. The key schedule, nonce derivation, and context binding are all handled by the standard.
@@ -120,6 +237,116 @@ Open http://localhost:5173 in your browser.
 cd examples/react-demo
 npm run build
 ```
+
+## On-Chain Key Registry
+
+The `contracts/X25519KeyRegistry.sol` contract stores X25519 public keys on-chain, indexed by `(account, version)`. It supports two registration paths:
+
+### Self-Registration (EOAs)
+
+```solidity
+registry.register(1, pubkeyBytes32);
+```
+
+`msg.sender` is the authenticator — no signature needed.
+
+### Delegated Registration (Contract Accounts / 4337 / Meta-Tx)
+
+```solidity
+// Relayer submits on behalf of `account`
+registry.registerFor(account, version, pubkey, deadline, eip712Signature);
+```
+
+The signature is an EIP-712 typed-data signature over:
+```
+Register(address account, uint32 version, bytes32 pubkey, uint256 nonce, uint256 deadline)
+```
+
+Key security properties:
+- **Per-account nonce** prevents replay (including replay-after-revoke)
+- **EIP-712 typed data** — wallets display the fields before signing
+- **Low-s enforcement** (EIP-2) on ECDSA signatures
+- **ERC-1271** support for contract account signatures
+- **Fork-safe domain separator** — recomputed if `chainid` changes
+
+### Key Revocation
+
+```solidity
+registry.revoke(version);  // Only msg.sender can revoke their own keys
+```
+
+Revoked version slots are permanently dead — the account must register with a fresh version number.
+
+### Lookups
+
+```solidity
+// Latest active key
+Record memory r = registry.getLatest(account);
+
+// Specific version (may be revoked or empty)
+Record memory r = registry.get(account, version);
+
+// Cheap presence check
+bool active = registry.isRegistered(account, version);
+```
+
+## ZK-Friendly Encryption (BabyJubJub KEM-DEM)
+
+In addition to the HPKE/X25519 API, the library provides a **ZK-friendly encryptor** built on the BabyJubJub curve over BN254. This is designed for encrypting payloads that will later be processed inside ZK circuits (e.g., SNARKs/STARKs), where operations over the BN254 scalar field `Fr` are native.
+
+### Architecture
+
+| Layer | Primitive | Purpose |
+|---|---|---|
+| **Curve** | BabyJubJub (Edwards over BN254) | ZK-native: point ops are cheap in-circuit |
+| **KEM** | ElGamal-style ephemeral key exchange | `ephemeral = G * r`, `shared = receiver_pub * r` |
+| **DEM** | Poseidon-derived keystream + field addition | Each payload element: `ciphertext[i] = payload[i] + keystream[i]` |
+| **Encoding** | Inputs are 32-byte big-endian Fr hex; ciphertext is hex-encoded 32-byte little-endian Fr elements | Matches the Rust/Circom wire format |
+
+The ciphertext format is:
+```
+[ct_0][ct_1]...[ct_n][ephemeral_x][ephemeral_y]
+```
+Each element is 32 bytes. The last two elements are the uncompressed ephemeral public key, allowing the receiver to recompute the shared secret and subtract the keystream.
+
+### API
+
+```javascript
+import init, { ZkEncryptor } from 'kem-dem-wasm'
+
+await init()
+
+// Generate a random BabyJubJub keypair
+const kp = ZkEncryptor.generateKeypair()
+// kp.secretKey        → "0x..."  (64 hex chars)
+// kp.publicKey.x      → "0x..."  (64 hex chars, BabyJubJub X coordinate)
+// kp.publicKey.y      → "0x..."  (64 hex chars, BabyJubJub Y coordinate)
+
+// Encrypt a payload of Fr field elements (array of 0x-prefixed 64-char hex strings)
+const payload = [
+  '0x0000000000000000000000000000000000000000000000000000000000000001',
+  '0x0000000000000000000000000000000000000000000000000000000000000002',
+]
+
+const ciphertext = ZkEncryptor.encrypt(kp.publicKey.x, kp.publicKey.y, payload)
+// ciphertext → hex string, length = (payload.length + 2) * 64
+
+// Decrypt back to Fr element hex strings
+const decrypted = ZkEncryptor.decrypt(kp.secretKey, ciphertext)
+// decrypted → ["0x...", "0x..."]  (same length as payload)
+```
+
+### Use Cases
+
+- **Private voting**: Encrypt votes as Fr elements, prove correctness in a SNARK without revealing plaintext
+- **Confidential transfers**: Encrypt amounts as field elements, verify balance constraints in-circuit
+- **ZK identity**: Encrypt identity attributes for selective disclosure proofs
+
+### Security Notes
+
+- The KEM uses a random ephemeral scalar `r` per encryption. Reusing `r` leaks the payload.
+- The DEM is a simple additive stream cipher (XOR in the field). It provides confidentiality but **no authentication**. If you need ciphertext integrity, wrap the output with an additional MAC or use the HPKE API for non-ZK data.
+- The ciphertext stores the ephemeral public key uncompressed `(x, y)` to avoid expensive point decompression inside circuits.
 
 ## License
 

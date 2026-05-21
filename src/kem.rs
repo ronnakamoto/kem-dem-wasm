@@ -65,14 +65,13 @@ impl X25519Hpke {
     ) -> Result<(Vec<u8>, SenderContext), CryptoError> {
         let recipient_public_key = HpkePublicKey::from_bytes(recipient_public_key)?;
         let mut rng = StdRng::from_os_rng();
-        let (encapped_key, context) =
-            setup_sender::<HpkeAead, HpkeKdf, HpkeKem, _>(
-                &OpModeS::Base,
-                &recipient_public_key,
-                info,
-                &mut rng,
-            )
-            .map_err(CryptoError::from)?;
+        let (encapped_key, context) = setup_sender::<HpkeAead, HpkeKdf, HpkeKem, _>(
+            &OpModeS::Base,
+            &recipient_public_key,
+            info,
+            &mut rng,
+        )
+        .map_err(CryptoError::from)?;
 
         Ok((
             encapped_key.to_bytes().as_slice().to_vec(),
@@ -114,7 +113,8 @@ mod tests {
     #[test]
     fn hpke_setup_sender_receiver_roundtrip() {
         let (pk, sk) = X25519Hpke::generate_keypair();
-        let (encapped_key, mut sender) = X25519Hpke::setup_sender(&pk, b"kem-dem-wasm/test").unwrap();
+        let (encapped_key, mut sender) =
+            X25519Hpke::setup_sender(&pk, b"kem-dem-wasm/test").unwrap();
         let ciphertext = sender.seal(b"field:a", b"secret payload").unwrap();
 
         let mut receiver =
@@ -162,7 +162,8 @@ mod tests {
     #[test]
     fn hpke_aad_mismatch_fails() {
         let (pk, sk) = X25519Hpke::generate_keypair();
-        let (encapped_key, mut sender) = X25519Hpke::setup_sender(&pk, b"kem-dem-wasm/test").unwrap();
+        let (encapped_key, mut sender) =
+            X25519Hpke::setup_sender(&pk, b"kem-dem-wasm/test").unwrap();
         let ciphertext = sender.seal(b"field:a", b"secret payload").unwrap();
 
         let mut receiver =

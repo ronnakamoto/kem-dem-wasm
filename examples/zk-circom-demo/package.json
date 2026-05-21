@@ -1,0 +1,17 @@
+{
+  "name": "zk-circom-demo",
+  "version": "1.0.0",
+  "description": "ZK Circom Demo for kem-dem-wasm",
+  "scripts": {
+    "clean": "rm -rf build inputs/*.json *.ptau",
+    "build:circuit": "mkdir -p build && circom circuits/ZkDecryptVerifier.circom --r1cs --wasm --sym -o build/",
+    "setup": "snarkjs powersoftau new bn128 12 pot12_0000.ptau -v && snarkjs powersoftau contribute pot12_0000.ptau pot12_0001.ptau --name=\"First contribution\" -v -e=\"random text\" && snarkjs powersoftau prepare phase2 pot12_0001.ptau pot12_final.ptau -v && snarkjs groth16 setup build/ZkDecryptVerifier.r1cs pot12_final.ptau build/ZkDecryptVerifier_0000.zkey && snarkjs zkey contribute build/ZkDecryptVerifier_0000.zkey build/ZkDecryptVerifier_final.zkey --name=\"1st Contributor Name\" -v -e=\"random text\" && snarkjs zkey export verificationkey build/ZkDecryptVerifier_final.zkey build/verification_key.json",
+    "generate-input": "node scripts/generate-input.js",
+    "prove": "cd build/ZkDecryptVerifier_js && node generate_witness.js ZkDecryptVerifier.wasm ../../inputs/input.json ../../build/witness.wtns && cd ../.. && snarkjs groth16 prove build/ZkDecryptVerifier_final.zkey build/witness.wtns build/proof.json build/public.json",
+    "verify": "snarkjs groth16 verify build/verification_key.json build/public.json build/proof.json",
+    "test": "npm run clean && npm run build:circuit && npm run setup && npm run generate-input && npm run prove && npm run verify"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5"
+  }
+}

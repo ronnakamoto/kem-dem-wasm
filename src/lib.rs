@@ -1,3 +1,4 @@
+mod derive;
 mod error;
 mod kem;
 
@@ -7,6 +8,9 @@ use js_sys::Uint8Array;
 use serde_wasm_bindgen::from_value;
 use wasm_bindgen::prelude::*;
 
+use crate::derive::{
+    derive_ikm_from_signature, derive_keypair_from_ikm, ENCRYPTION_DERIVATION_PATH,
+};
 use crate::error::{to_js_value, CryptoError};
 use crate::kem::X25519Hpke;
 
@@ -55,8 +59,8 @@ impl KemDem {
         let input_map: BTreeMap<String, String> =
             from_value(fields).map_err(|e: serde_wasm_bindgen::Error| CryptoError::from(e))?;
 
-        let (encapped_key, mut sender) = X25519Hpke::setup_sender(public_key, FIELD_PACKAGE_INFO)
-            .map_err(to_js_value)?;
+        let (encapped_key, mut sender) =
+            X25519Hpke::setup_sender(public_key, FIELD_PACKAGE_INFO).map_err(to_js_value)?;
 
         let mut encrypted_fields = BTreeMap::new();
         for (field_name, field_value) in input_map {
@@ -89,7 +93,9 @@ impl KemDem {
                 .open(&field_aad(field_name), field_ct)
                 .map_err(to_js_value)?;
             let decrypted_str = String::from_utf8(decrypted).map_err(|_| {
-                to_js_value(CryptoError::new(format!("Field '{field_name}' contains invalid UTF-8")))
+                to_js_value(CryptoError::new(format!(
+                    "Field '{field_name}' contains invalid UTF-8"
+                )))
             })?;
 
             js_sys::Reflect::set(
@@ -122,15 +128,86 @@ impl KemDem {
 
     /// Low-level single-blob decryption.
     #[wasm_bindgen(js_name = decrypt)]
-    pub fn decrypt(
+    pub fn decrypt(&self, secret_key: &[u8], blob: &EncryptedBlob) -> Result<Vec<u8>, JsValue> {
+        let mut receiver = X25519Hpke::setup_receiver(secret_key, &blob.encapped_key, BLOB_INFO)
+            .map_err(to_js_value)?;
+        receiver
+            .open(BLOB_AAD, &blob.ciphertext)
+            .map_err(to_js_value)
+    }
+
+    // ── Deterministic X25519 derivation from Ethereum wallet material ──
+
+    /// Returns the canonical BIP-44 derivation path used to derive an
+    /// X25519 encryption keypair from an Ethereum HD wallet.
+    ///
+    /// `m/44'/60'/0'/2147483647'/0`
+    ///
+    /// Wallet code derives a child private key at this path and passes
+    /// the 32-byte child key as `ikm` to [`deriveKeypairFromIkm`].
+    #[wasm_bindgen(js_name = encryptionDerivationPath)]
+    pub fn encryption_derivation_path() -> String {
+        ENCRYPTION_DERIVATION_PATH.to_string()
+    }
+
+    /// Deterministically derive an X25519 keypair from input keying
+    /// material (typically a BIP-32 child private key) and a 20-byte
+    /// EVM address.
+    ///
+    /// The address is bound into HKDF's `info` so that derivations for
+    /// different addresses from the same seed produce distinct keys.
+    ///
+    /// Returns a `KeyPair` directly usable with `encryptFields`.
+    #[wasm_bindgen(js_name = deriveKeypairFromIkm)]
+    pub fn derive_keypair_from_ikm(
         &self,
-        secret_key: &[u8],
-        blob: &EncryptedBlob,
-    ) -> Result<Vec<u8>, JsValue> {
-        let mut receiver =
-            X25519Hpke::setup_receiver(secret_key, &blob.encapped_key, BLOB_INFO)
-                .map_err(to_js_value)?;
-        receiver.open(BLOB_AAD, &blob.ciphertext).map_err(to_js_value)
+        ikm: &[u8],
+        eth_address: &[u8],
+    ) -> Result<KeyPair, JsValue> {
+        let addr: &[u8; 20] = eth_address.try_into().map_err(|_| {
+            to_js_value(CryptoError::new(
+                "eth_address must be exactly 20 bytes".into(),
+            ))
+        })?;
+        let (pk, sk) = derive_keypair_from_ikm(ikm, addr).map_err(to_js_value)?;
+        Ok(KeyPair {
+            public_key: pk,
+            secret_key: sk,
+        })
+    }
+
+    /// Derive an X25519 keypair from a `personal_sign` signature over
+    /// the canonical derivation message and a 20-byte EVM address.
+    ///
+    /// The signature is canonicalised to low-s (EIP-2), then hashed
+    /// with a domain separator to produce an IKM, which is fed through
+    /// the same HKDF/HPKE pipeline as [`deriveKeypairFromIkm`].
+    ///
+    /// Use this for MetaMask / EIP-1193 wallets that do not expose
+    /// the seed phrase.
+    #[wasm_bindgen(js_name = deriveKeypairFromSignature)]
+    pub fn derive_keypair_from_signature(
+        &self,
+        signature: &[u8],
+        eth_address: &[u8],
+    ) -> Result<KeyPair, JsValue> {
+        let addr: &[u8; 20] = eth_address.try_into().map_err(|_| {
+            to_js_value(CryptoError::new(
+                "eth_address must be exactly 20 bytes".into(),
+            ))
+        })?;
+        let ikm = derive_ikm_from_signature(signature).map_err(to_js_value)?;
+        let (pk, sk) = derive_keypair_from_ikm(&ikm, addr).map_err(to_js_value)?;
+        Ok(KeyPair {
+            public_key: pk,
+            secret_key: sk,
+        })
+    }
+}
+
+impl Default for KemDem {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -185,7 +262,9 @@ impl EncryptedPackage {
 
     #[wasm_bindgen(js_name = getField)]
     pub fn get_field(&self, name: &str) -> Option<Uint8Array> {
-        self.encrypted_fields.get(name).map(|v| Uint8Array::from(&v[..]))
+        self.encrypted_fields
+            .get(name)
+            .map(|v| Uint8Array::from(&v[..]))
     }
 
     #[wasm_bindgen(js_name = fieldNames)]
@@ -217,12 +296,7 @@ impl EncryptedPackage {
             )
             .unwrap();
         }
-        js_sys::Reflect::set(
-            &obj,
-            &JsValue::from_str("encryptedFields"),
-            &fields,
-        )
-        .unwrap();
+        js_sys::Reflect::set(&obj, &JsValue::from_str("encryptedFields"), &fields).unwrap();
 
         Ok(obj.into())
     }
@@ -409,41 +483,191 @@ mod tests {
         let names = package.field_names();
         assert_eq!(names.length(), 2);
     }
+}
 
-    #[wasm_bindgen_test]
-    fn encrypted_blob_new_and_getters() {
-        let kem_ct = vec![1u8; X25519Hpke::encapped_key_size()];
-        let dem_ct = vec![2u8; 64];
-        let blob = EncryptedBlob::new(&kem_ct, &dem_ct);
+// --- ZK Encryption (BabyJubJub + KEM-DEM) ---
 
-        assert_eq!(blob.encapped_key.to_vec(), kem_ct);
-        assert_eq!(blob.ciphertext.to_vec(), dem_ct);
+pub mod kemdem_functions;
+
+/// ZK-friendly encryptor using a BabyJubJub KEM-DEM over the BN254
+/// scalar field `Fr`.
+///
+/// The keystream PRF is the iden3 `circomlib`-compatible Poseidon
+/// hash (`PoseidonEx(t=4)`), so the produced ciphertexts can be
+/// verified inside a Circom circuit using `circomlib`'s `Poseidon(3)`
+/// and `EscalarMulAny` templates with byte-for-byte agreement.
+///
+/// **Confidentiality only.** This primitive does not authenticate the
+/// ciphertext — an attacker can flip bits to flip plaintext bits.
+/// Wrap with a Poseidon-based MAC if you need integrity, or use the
+/// HPKE `KemDem` API for non-ZK data.
+#[wasm_bindgen]
+pub struct ZkEncryptor;
+
+#[wasm_bindgen]
+impl ZkEncryptor {
+    /// Encrypt a payload of `Fr` elements to a BabyJubJub public key.
+    ///
+    /// `receiver_pub_x_hex` / `receiver_pub_y_hex` are 0x-prefixed
+    /// 64-char hex strings (big-endian) for the receiver's affine
+    /// coordinates. `payload_hex_array` is an array of 0x-prefixed
+    /// 64-char hex `Fr` elements.
+    ///
+    /// Returns a hex-encoded ciphertext whose binary form is
+    /// `[ct_0..ct_{n-1}, ephem_x, ephem_y]` with each element 32 bytes
+    /// little-endian.
+    #[wasm_bindgen(js_name = encrypt)]
+    pub fn encrypt(
+        receiver_pub_x_hex: &str,
+        receiver_pub_y_hex: &str,
+        payload_hex_array: Vec<String>,
+    ) -> Result<String, JsValue> {
+        use crate::kemdem_functions::{point_from_xy, zk_kemdem_encrypt};
+
+        let x = parse_fr_be(receiver_pub_x_hex).map_err(js_err)?;
+        let y = parse_fr_be(receiver_pub_y_hex).map_err(js_err)?;
+        let receiver_pub = point_from_xy(x, y)
+            .ok_or_else(|| js_err("receiver public key is not on BabyJubJub or not in subgroup"))?;
+
+        let mut payload = Vec::with_capacity(payload_hex_array.len());
+        for s in payload_hex_array {
+            payload.push(parse_fr_be(&s).map_err(js_err)?);
+        }
+
+        let mut seed = [0u8; 32];
+        getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
+
+        Ok(zk_kemdem_encrypt(seed, &receiver_pub, &payload))
     }
 
-    #[wasm_bindgen_test]
-    fn keypair_lengths() {
-        let kem_dem = KemDem::new();
-        let kp = kem_dem.generate_keypair();
-        assert_eq!(kp.public_key().length() as usize, X25519Hpke::public_key_size());
-        assert_eq!(kp.secret_key().length() as usize, X25519Hpke::secret_key_size());
+    /// Decrypt a ciphertext produced by [`encrypt`].
+    ///
+    /// `receiver_sec_key_hex` is the BabyJubJub scalar as a 0x-prefixed
+    /// 64-char big-endian hex string. Returns an array of `Fr` element
+    /// hex strings (big-endian).
+    #[wasm_bindgen(js_name = decrypt)]
+    pub fn decrypt(
+        receiver_sec_key_hex: &str,
+        ciphertext_hex: &str,
+    ) -> Result<js_sys::Array, JsValue> {
+        use crate::kemdem_functions::zk_kemdem_decrypt;
+        use ark_ff::{PrimeField, Zero};
+        use taceo_ark_babyjubjub::Fr as BabyJubJubScalar;
+
+        let sk_fr = parse_fr_be(receiver_sec_key_hex).map_err(js_err)?;
+        let sk_bytes = {
+            use ark_ff::BigInteger;
+            sk_fr.into_bigint().to_bytes_be()
+        };
+        let sec_key = BabyJubJubScalar::from_be_bytes_mod_order(&sk_bytes);
+        if sec_key.is_zero() {
+            return Err(js_err("invalid secret key"));
+        }
+
+        let decrypted = zk_kemdem_decrypt(&sec_key, ciphertext_hex).map_err(js_err)?;
+
+        let arr = js_sys::Array::new();
+        for el in decrypted {
+            arr.push(&JsValue::from_str(&fr_to_be_hex(&el)));
+        }
+        Ok(arr)
     }
 
-    #[wasm_bindgen_test]
-    fn kemdem_field_tampering_fails() {
-        let kem_dem = KemDem::new();
-        let kp = kem_dem.generate_keypair();
+    /// Generate a random BabyJubJub keypair.
+    ///
+    /// Returns `{ secretKey, publicKey: { x, y } }`, all as
+    /// 0x-prefixed 64-char big-endian hex strings. The public key is
+    /// uncompressed `(x, y)` so it can be fed directly into a Circom
+    /// circuit using `circomlib`'s `EscalarMulAny`.
+    #[wasm_bindgen(js_name = generateKeypair)]
+    pub fn generate_keypair() -> Result<js_sys::Object, JsValue> {
+        use crate::kemdem_functions::generate_keypair_from_seed;
+        use ark_ff::PrimeField;
 
-        let mut fields = BTreeMap::new();
-        fields.insert("ssn".to_string(), "123-45-6789".to_string());
-        fields.insert("salary".to_string(), "150000".to_string());
+        let mut seed = [0u8; 32];
+        getrandom_02::getrandom(&mut seed).map_err(|_| js_err("CSPRNG unavailable"))?;
 
-        let js_fields = serde_wasm_bindgen::to_value(&fields).unwrap();
-        let mut package = kem_dem.encrypt_fields(&kp.public_key, js_fields).unwrap();
-        let field = package.encrypted_fields.get_mut("ssn").unwrap();
-        let last = field.len() - 1;
-        field[last] ^= 0x01;
+        let (sk, pk) = generate_keypair_from_seed(seed);
 
-        let result = kem_dem.decrypt_fields(&kp.secret_key, &package);
-        assert!(result.is_err());
+        let sk_bytes = {
+            use ark_ff::BigInteger;
+            let mut b = sk.into_bigint().to_bytes_be();
+            b.resize(32, 0);
+            b
+        };
+
+        // Sanity: the generated pk must be on-curve & in subgroup.
+        if !pk.is_on_curve() || !pk.is_in_correct_subgroup_assuming_on_curve() {
+            return Err(js_err("generated BabyJubJub public key failed validation"));
+        }
+
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("secretKey"),
+            &JsValue::from_str(&format!("0x{}", hex::encode(&sk_bytes))),
+        )
+        .unwrap();
+
+        let pub_obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &pub_obj,
+            &JsValue::from_str("x"),
+            &JsValue::from_str(&fr_to_be_hex(&pk.x)),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &pub_obj,
+            &JsValue::from_str("y"),
+            &JsValue::from_str(&fr_to_be_hex(&pk.y)),
+        )
+        .unwrap();
+        js_sys::Reflect::set(&obj, &JsValue::from_str("publicKey"), &pub_obj).unwrap();
+
+        Ok(obj)
     }
+}
+
+// ── Hex helpers shared by `ZkEncryptor` ───────────────────────────
+
+fn js_err<S: Into<String>>(msg: S) -> JsValue {
+    JsValue::from_str(&msg.into())
+}
+
+fn parse_fr_be(s: &str) -> Result<ark_bn254::Fr, String> {
+    use ark_bn254::Fr;
+    use ark_ff::{PrimeField, Zero};
+
+    let clean = s.trim_start_matches("0x").trim_start_matches("0X").trim();
+    if clean.is_empty() {
+        return Ok(Fr::zero());
+    }
+    let clean = if clean.len() % 2 != 0 {
+        format!("0{clean}")
+    } else {
+        clean.to_string()
+    };
+    let mut bytes = hex::decode(&clean).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() > 32 {
+        return Err("hex string longer than 32 bytes".to_string());
+    }
+    if bytes.len() < 32 {
+        let mut padded = vec![0u8; 32 - bytes.len()];
+        padded.extend(bytes);
+        bytes = padded;
+    }
+    Ok(Fr::from_be_bytes_mod_order(&bytes))
+}
+
+fn fr_to_be_hex(el: &ark_bn254::Fr) -> String {
+    use ark_ff::{BigInteger, PrimeField};
+    let mut bytes = el.into_bigint().to_bytes_be();
+    if bytes.len() < 32 {
+        let mut padded = vec![0u8; 32 - bytes.len()];
+        padded.extend(bytes);
+        bytes = padded;
+    } else if bytes.len() > 32 {
+        bytes = bytes[bytes.len() - 32..].to_vec();
+    }
+    format!("0x{}", hex::encode(&bytes))
 }

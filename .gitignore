@@ -4,6 +4,7 @@ Cargo.lock
 
 # Generated WASM package
 /pkg
+/pkg-node
 
 # Node.js
 node_modules/
@@ -14,6 +15,9 @@ package-lock.json
 
 # Build outputs
 /examples/react-demo/dist
+/examples/zk-circom-demo/build/
+/examples/zk-circom-demo/inputs/*.json
+/examples/zk-circom-demo/*.ptau
 
 # IDE
 .idea/

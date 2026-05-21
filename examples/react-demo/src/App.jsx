@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import init, { KemDem } from 'kem-dem-wasm'
+import init, { KemDem, ZkEncryptor } from 'kem-dem-wasm'
 import SecureForm from './components/SecureForm'
 import './App.css'
 
@@ -20,6 +20,9 @@ function App() {
 
         setKemDem(new KemDem())
         setWasmReady(true)
+
+        const zkKp = ZkEncryptor.generateKeypair()
+        window.__zkKeypair = zkKp
       } catch (err) {
         console.error('Failed to initialize WASM:', err)
         if (!cancelled) {
@@ -66,7 +69,7 @@ function App() {
         </p>
       </header>
       <main>
-        <SecureForm kemDem={kemDem} />
+        <SecureForm kemDem={kemDem} zkEncryptor={ZkEncryptor} />
       </main>
       <footer className="app-footer">
         <p>
