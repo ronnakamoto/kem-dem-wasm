@@ -551,15 +551,9 @@ impl ZkEncryptor {
         ciphertext_hex: &str,
     ) -> Result<js_sys::Array, JsValue> {
         use crate::kemdem_functions::zk_kemdem_decrypt;
-        use ark_ff::{PrimeField, Zero};
-        use taceo_ark_babyjubjub::Fr as BabyJubJubScalar;
+        use ark_ff::Zero;
 
-        let sk_fr = parse_fr_be(receiver_sec_key_hex).map_err(js_err)?;
-        let sk_bytes = {
-            use ark_ff::BigInteger;
-            sk_fr.into_bigint().to_bytes_be()
-        };
-        let sec_key = BabyJubJubScalar::from_be_bytes_mod_order(&sk_bytes);
+        let sec_key = parse_babyjubjub_scalar_be(receiver_sec_key_hex).map_err(js_err)?;
         if sec_key.is_zero() {
             return Err(js_err("invalid secret key"));
         }
@@ -591,9 +585,11 @@ impl ZkEncryptor {
 
         let sk_bytes = {
             use ark_ff::BigInteger;
-            let mut b = sk.into_bigint().to_bytes_be();
-            b.resize(32, 0);
-            b
+            let be = sk.into_bigint().to_bytes_be();
+            let mut padded = vec![0u8; 32];
+            let start = 32usize.saturating_sub(be.len());
+            padded[start..].copy_from_slice(&be[be.len().saturating_sub(32)..]);
+            padded
         };
 
         // Sanity: the generated pk must be on-curve & in subgroup.
@@ -657,6 +653,43 @@ fn parse_fr_be(s: &str) -> Result<ark_bn254::Fr, String> {
         bytes = padded;
     }
     Ok(Fr::from_be_bytes_mod_order(&bytes))
+}
+
+/// Parse a big-endian hex string directly into a BabyJubJub scalar,
+/// rejecting values ≥ the subgroup order instead of silently reducing.
+fn parse_babyjubjub_scalar_be(s: &str) -> Result<taceo_ark_babyjubjub::Fr, String> {
+    use ark_ff::{BigInteger, PrimeField};
+    use taceo_ark_babyjubjub::Fr as BabyJubJubScalar;
+
+    let clean = s.trim_start_matches("0x").trim_start_matches("0X").trim();
+    if clean.is_empty() {
+        return Err("secret key hex is empty".to_string());
+    }
+    let clean = if clean.len() % 2 != 0 {
+        format!("0{clean}")
+    } else {
+        clean.to_string()
+    };
+    let bytes = hex::decode(&clean).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() > 32 {
+        return Err("secret key hex longer than 32 bytes".to_string());
+    }
+    // Pad to 32 bytes big-endian, then convert to LE for ark-ff.
+    let mut le = vec![0u8; 32];
+    le[32 - bytes.len()..].copy_from_slice(&bytes);
+    le.reverse();
+    // Reduce mod the BabyJubJub scalar field order.
+    let scalar = BabyJubJubScalar::from_le_bytes_mod_order(&le);
+    // Roundtrip check: if the canonical LE representation differs from
+    // the input, the value was >= the field modulus and got reduced.
+    let mut canonical_le = scalar.into_bigint().to_bytes_le();
+    canonical_le.resize(32, 0);
+    if canonical_le != le {
+        return Err(
+            "secret key is not a canonical BabyJubJub scalar (value >= subgroup order)".to_string(),
+        );
+    }
+    Ok(scalar)
 }
 
 fn fr_to_be_hex(el: &ark_bn254::Fr) -> String {
