@@ -11,13 +11,16 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wasm-bindgen = "0.2.92"
-js-sys = "0.3.69"
+wasm-bindgen = "0.2.121"
+js-sys = "0.3.98"
 serde = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
 hpke = { version = "0.13.0", default-features = false, features = ["alloc", "x25519"] }
-rand = { version = "0.9.2", default-features = false, features = ["os_rng", "std_rng"] }
+rand = { version = "0.9.4", default-features = false, features = ["os_rng", "std_rng"] }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
+# getrandom 0.2 is pulled in transitively by rand 0.8 → rand_core 0.6.
+# We must list it as a direct dep here so Cargo enables the "js" feature.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 console_error_panic_hook = "0.1.7"
 hkdf = "0.12"
 sha2 = "0.10"
@@ -35,4 +38,4 @@ light-poseidon = "0.4"
 taceo-ark-babyjubjub = { version = "0.5.3", default-features = false }
 
 [dev-dependencies]
-wasm-bindgen-test = "0.3.34"
+wasm-bindgen-test = "0.3.71"
