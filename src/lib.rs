@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use js_sys::Uint8Array;
 use serde_wasm_bindgen::from_value;
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::derive::{
     derive_ikm_from_signature, derive_keypair_from_ikm, ENCRYPTION_DERIVATION_PATH,
@@ -43,7 +44,7 @@ impl KemDem {
         let (pk, sk) = X25519Hpke::generate_keypair();
         KeyPair {
             public_key: pk,
-            secret_key: sk,
+            secret_key: Zeroizing::new(sk),
         }
     }
 
@@ -172,7 +173,7 @@ impl KemDem {
         let (pk, sk) = derive_keypair_from_ikm(ikm, addr).map_err(to_js_value)?;
         Ok(KeyPair {
             public_key: pk,
-            secret_key: sk,
+            secret_key: Zeroizing::new(sk),
         })
     }
 
@@ -200,7 +201,7 @@ impl KemDem {
         let (pk, sk) = derive_keypair_from_ikm(&ikm, addr).map_err(to_js_value)?;
         Ok(KeyPair {
             public_key: pk,
-            secret_key: sk,
+            secret_key: Zeroizing::new(sk),
         })
     }
 }
@@ -214,10 +215,9 @@ impl Default for KemDem {
 // --- WASM Exported Types ---
 
 #[wasm_bindgen]
-#[derive(Clone)]
 pub struct KeyPair {
     public_key: Vec<u8>,
-    secret_key: Vec<u8>,
+    secret_key: Zeroizing<Vec<u8>>,
 }
 
 #[wasm_bindgen]
