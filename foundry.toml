@@ -1,0 +1,17 @@
+[profile.default]
+src           = "contracts"
+test          = "contracts/test"
+out           = "contracts/out"
+libs          = ["contracts/lib"]
+cache_path    = "contracts/cache"
+solc_version  = "0.8.24"
+optimizer     = true
+optimizer_runs = 200
+# The src dir contains only the contract file; tests live under
+# contracts/test/ and pull the contract in via a relative import.
+auto_detect_solc = false
+
+[fmt]
+line_length = 100
+tab_width   = 4
+quote_style = "double"

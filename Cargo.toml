@@ -1,11 +1,14 @@
 [package]
 name = "kem-dem-wasm"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["Ron Nakamoto <adarshron@gmail.com>"]
-description = "WASM KEM-DEM hybrid encryption with flexible field support"
+description = "WASM KEM-DEM hybrid encryption with flexible field support and a ZK-friendly authenticated DEM"
 repository = "https://github.com/ronnakamoto/kem-dem-wasm"
 license = "MIT OR Apache-2.0"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -39,3 +42,16 @@ taceo-ark-babyjubjub = { version = "0.5.3", default-features = false }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.71"
+
+# Production-grade release profile: full LTO, single codegen unit, and
+# `opt-level = "s"` to minimise WASM binary size without sacrificing
+# correctness. Strip debug symbols and abort on panic to shave a
+# few more KB off the shipped artefact.
+[profile.release]
+opt-level    = "s"
+lto          = "fat"
+codegen-units = 1
+panic        = "abort"
+strip        = "symbols"
+debug        = false
+overflow-checks = false

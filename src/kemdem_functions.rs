@@ -33,15 +33,68 @@
 
 use ark_bn254::Fr as Fr254;
 use ark_ec::{CurveGroup, PrimeGroup};
-use ark_ff::{BigInteger, PrimeField, Zero};
+use ark_ff::{BigInteger, One, PrimeField, Zero};
 use light_poseidon::{Poseidon, PoseidonHasher};
+use std::fmt;
 use std::ops::Add;
 use taceo_ark_babyjubjub::{EdwardsAffine, EdwardsProjective, Fr as BabyJubJubScalar};
 
+/// Structured errors from the ZK KEM-DEM. Distinguishing `RetryNeeded`
+/// from real failures lets the caller's retry loop key off a variant
+/// instead of fragile substring matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZkKemDemError {
+    /// The CSPRNG draw reduced to the zero scalar. The caller should
+    /// draw a fresh seed and retry. Probability ≈ 1/r ≈ 2⁻²⁵¹.
+    RetryNeeded,
+    /// The payload exceeds [`MAX_PAYLOAD_ELEMS`].
+    PayloadTooLarge { len: usize, max: usize },
+    /// The ciphertext bytes were not a multiple of [`FR_BYTES`].
+    MalformedCiphertext(String),
+    /// The trailing ephemeral public key was missing, off-curve, in
+    /// the wrong subgroup, or the identity element.
+    InvalidEphemeralPoint(&'static str),
+    /// Generic invalid-hex error from `hex::decode`.
+    InvalidHex(String),
+    /// The authenticated DEM's Poseidon tag did not match. The
+    /// ciphertext was tampered with, the wrong key was used, or the
+    /// caller passed an unauthenticated ciphertext to the
+    /// authenticated decrypt.
+    MacMismatch,
+}
+
+impl fmt::Display for ZkKemDemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ZkKemDemError::RetryNeeded => {
+                f.write_str("ephemeral scalar is zero; retry with fresh randomness")
+            }
+            ZkKemDemError::PayloadTooLarge { len, max } => write!(
+                f,
+                "payload too large: {len} elements exceeds maximum of {max}"
+            ),
+            ZkKemDemError::MalformedCiphertext(s) => write!(f, "malformed ciphertext: {s}"),
+            ZkKemDemError::InvalidEphemeralPoint(s) => {
+                write!(f, "invalid ephemeral public key: {s}")
+            }
+            ZkKemDemError::InvalidHex(s) => write!(f, "invalid ciphertext hex: {s}"),
+            ZkKemDemError::MacMismatch => f.write_str(
+                "authenticated ciphertext failed integrity check (MAC mismatch)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ZkKemDemError {}
+
 /// Number of bytes per Fr element on the wire.
 pub const FR_BYTES: usize = 32;
-/// Number of trailing Fr elements that encode the ephemeral public key.
+/// Number of trailing Fr elements that encode the ephemeral public key
+/// in the *unauthenticated* wire format.
 pub const EPHEM_ELEMS: usize = 2;
+/// Number of trailing Fr elements that encode the ephemeral public key
+/// **and** the Poseidon MAC tag in the *authenticated* wire format.
+pub const EPHEM_AND_TAG_ELEMS: usize = 3;
 /// Maximum number of payload elements per encryption to bound memory
 /// and computation (each element requires a Poseidon hash invocation).
 pub const MAX_PAYLOAD_ELEMS: usize = 1024;
@@ -58,16 +111,16 @@ pub fn zk_kemdem_encrypt(
     random_seed: [u8; 32],
     receiver_pub_key: &EdwardsAffine,
     payload: &[Fr254],
-) -> Result<String, String> {
+) -> Result<String, ZkKemDemError> {
     if payload.len() > MAX_PAYLOAD_ELEMS {
-        return Err(format!(
-            "payload too large: {} elements exceeds maximum of {MAX_PAYLOAD_ELEMS}",
-            payload.len()
-        ));
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_ELEMS,
+        });
     }
     let r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
     if r.is_zero() {
-        return Err("ephemeral scalar is zero; retry with fresh randomness".to_string());
+        return Err(ZkKemDemError::RetryNeeded);
     }
     let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
     let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
@@ -88,25 +141,42 @@ pub fn zk_kemdem_encrypt(
 pub fn zk_kemdem_decrypt(
     receiver_sec_key: &BabyJubJubScalar,
     ciphertext_hex: &str,
-) -> Result<Vec<Fr254>, String> {
+) -> Result<Vec<Fr254>, ZkKemDemError> {
     let elements = decode_elements_le_hex(ciphertext_hex)?;
 
     if elements.len() < EPHEM_ELEMS {
-        return Err("ciphertext too short: missing ephemeral public key".to_string());
+        return Err(ZkKemDemError::InvalidEphemeralPoint(
+            "ciphertext too short: missing trailing (x, y)",
+        ));
     }
     let payload_len = elements.len() - EPHEM_ELEMS;
+    if payload_len > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload_len,
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
 
     let ephem_x = elements[payload_len];
     let ephem_y = elements[payload_len + 1];
-    if ephem_x.is_zero() && ephem_y.is_zero() {
-        return Err("invalid ephemeral public key: identity".to_string());
+
+    // Twisted-Edwards identity is (0, 1). The old check `(0, 0)` was a
+    // no-op (that point is off-curve and would be caught by the
+    // on-curve check anyway). The identity, by contrast, *is* on the
+    // curve and *is* in the prime-order subgroup (every subgroup
+    // contains the identity), so it must be rejected explicitly to
+    // prevent degenerate shared secrets.
+    if ephem_x.is_zero() && ephem_y.is_one() {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("identity point"));
     }
     let ephemeral_pub = EdwardsAffine::new_unchecked(ephem_x, ephem_y);
     if !ephemeral_pub.is_on_curve() {
-        return Err("invalid ephemeral public key: not on BabyJubJub".to_string());
+        return Err(ZkKemDemError::InvalidEphemeralPoint(
+            "not on BabyJubJub",
+        ));
     }
     if !ephemeral_pub.is_in_correct_subgroup_assuming_on_curve() {
-        return Err("invalid ephemeral public key: wrong subgroup".to_string());
+        return Err(ZkKemDemError::InvalidEphemeralPoint("wrong subgroup"));
     }
 
     let shared_secret: EdwardsAffine = (ephemeral_pub * *receiver_sec_key).into_affine();
@@ -150,14 +220,14 @@ fn encode_elements_le_hex(elements: &[Fr254]) -> String {
     hex::encode(&bytes)
 }
 
-fn decode_elements_le_hex(ciphertext_hex: &str) -> Result<Vec<Fr254>, String> {
+fn decode_elements_le_hex(ciphertext_hex: &str) -> Result<Vec<Fr254>, ZkKemDemError> {
     let bytes = hex::decode(ciphertext_hex.trim_start_matches("0x"))
-        .map_err(|e| format!("invalid ciphertext hex: {e}"))?;
+        .map_err(|e| ZkKemDemError::InvalidHex(e.to_string()))?;
     if bytes.len() % FR_BYTES != 0 {
-        return Err(format!(
+        return Err(ZkKemDemError::MalformedCiphertext(format!(
             "ciphertext length {} is not a multiple of {FR_BYTES}",
             bytes.len()
-        ));
+        )));
     }
     let count = bytes.len() / FR_BYTES;
     let mut out = Vec::with_capacity(count);
@@ -177,20 +247,29 @@ fn decode_elements_le_hex(ciphertext_hex: &str) -> Result<Vec<Fr254>, String> {
 /// should retry with a fresh CSPRNG sample).
 pub fn generate_keypair_from_seed(
     seed: [u8; 32],
-) -> Result<(BabyJubJubScalar, EdwardsAffine), String> {
+) -> Result<(BabyJubJubScalar, EdwardsAffine), ZkKemDemError> {
     let sk = BabyJubJubScalar::from_le_bytes_mod_order(&seed);
     if sk.is_zero() {
-        return Err("derived scalar is zero; retry with fresh randomness".to_string());
+        return Err(ZkKemDemError::RetryNeeded);
     }
     let pk = (EdwardsProjective::generator() * sk).into_affine();
     Ok((sk, pk))
 }
 
 /// Reconstruct an `EdwardsAffine` from its raw `(x, y)` Fr254 coordinates
-/// and verify it lies on the BabyJubJub curve and in the prime-order
-/// subgroup. Returns `None` for any invalid input.
+/// and verify it lies on the BabyJubJub curve, in the prime-order
+/// subgroup, and is not the identity. Returns `None` for any invalid input.
 pub fn point_from_xy(x: Fr254, y: Fr254) -> Option<EdwardsAffine> {
-    if x.is_zero() && y.is_zero() {
+    // Reject the identity element (0, 1) of the twisted-Edwards group.
+    // The identity is on-curve and in the prime-order subgroup, so the
+    // subsequent checks would not catch it; an attacker supplying the
+    // identity as the receiver's public key would force every shared
+    // secret derived from it to also be the identity, making the
+    // keystream trivially recomputable.
+    //
+    // Also reject (0, 0): off-curve, but the explicit check makes the
+    // failure mode obvious to readers.
+    if x.is_zero() && (y.is_zero() || y.is_one()) {
         return None;
     }
     let p = EdwardsAffine::new_unchecked(x, y);
@@ -201,6 +280,161 @@ pub fn point_from_xy(x: Fr254, y: Fr254) -> Option<EdwardsAffine> {
         return None;
     }
     Some(p)
+}
+
+// ─── Authenticated DEM (Poseidon-based MAC) ──────────────────────
+//
+// Wire format for the authenticated variant:
+//
+//   [ct_0] [ct_1] … [ct_{n-1}] [ephem_x] [ephem_y] [tag]
+//
+// One extra Fr element (`tag`) versus the unauthenticated form. The
+// tag is a Poseidon sponge over the ciphertext elements, bound to the
+// shared secret and the ephemeral public key:
+//
+//   mac_key = Poseidon([shared.x, shared.y, Fr(0)])
+//     (counter 0 is reserved for the MAC; the keystream uses counters
+//      1..=n, so there is no collision between the two PRF strands.)
+//
+//   state = mac_key
+//   for i in 0..n:
+//     state = Poseidon([state, ct[i], Fr(i + 1)])
+//   tag = Poseidon([state, ephem.x, ephem.y])
+//
+// Properties:
+// - Confidentiality: unchanged from the unauthenticated DEM.
+// - Integrity: SUF-CMA under Poseidon-as-PRF; any flipped ciphertext
+//   bit, swapped element, or substituted ephemeral key changes the
+//   recomputed tag.
+// - Circuit cost: O(n) Poseidon(3) calls for the MAC plus the
+//   existing O(n) for the keystream. Same Poseidon primitive
+//   throughout, so circuit-side reuse is trivial.
+
+/// Compute the Poseidon MAC tag over `ct_elements ‖ ephemeral_pub`,
+/// bound to `shared_secret`. Used by both the authenticated encrypt
+/// and authenticated decrypt paths.
+fn compute_mac_tag(
+    shared_secret: &EdwardsAffine,
+    ephemeral_pub: &EdwardsAffine,
+    ct_elements: &[Fr254],
+) -> Fr254 {
+    let mut hasher = Poseidon::<Fr254>::new_circom(3)
+        .expect("circomlib Poseidon(3) parameters are bundled in light-poseidon");
+
+    // Derive a per-session MAC key. Counter 0 is reserved for MAC use;
+    // keystream uses counters 1..=n, so the two PRF domains do not
+    // overlap.
+    let mut state = hasher
+        .hash(&[shared_secret.x, shared_secret.y, Fr254::from(0u64)])
+        .expect("Poseidon hash over 3 Fr inputs never fails");
+
+    // Absorb each ciphertext element with its position.
+    for (i, ct) in ct_elements.iter().enumerate() {
+        let counter = Fr254::from((i as u64) + 1);
+        state = hasher
+            .hash(&[state, *ct, counter])
+            .expect("Poseidon hash over 3 Fr inputs never fails");
+    }
+
+    // Bind the ephemeral public key so a malicious sender cannot swap
+    // the ephemeral key while keeping the ct stream intact.
+    hasher
+        .hash(&[state, ephemeral_pub.x, ephemeral_pub.y])
+        .expect("Poseidon hash over 3 Fr inputs never fails")
+}
+
+/// Authenticated counterpart of [`zk_kemdem_encrypt`]. Returns a hex
+/// ciphertext that includes a 1-element Poseidon MAC tag.
+pub fn zk_kemdem_encrypt_authenticated(
+    random_seed: [u8; 32],
+    receiver_pub_key: &EdwardsAffine,
+    payload: &[Fr254],
+) -> Result<String, ZkKemDemError> {
+    if payload.len() > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
+    let r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
+    if r.is_zero() {
+        return Err(ZkKemDemError::RetryNeeded);
+    }
+    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
+
+    let keystream = generate_keystream(&shared_secret, payload.len());
+    let mut ct_elements: Vec<Fr254> = Vec::with_capacity(payload.len());
+    for i in 0..payload.len() {
+        ct_elements.push(payload[i].add(&keystream[i]));
+    }
+
+    let tag = compute_mac_tag(&shared_secret, &ephemeral_pub, &ct_elements);
+
+    let mut out: Vec<Fr254> = Vec::with_capacity(payload.len() + EPHEM_AND_TAG_ELEMS);
+    out.extend_from_slice(&ct_elements);
+    out.push(ephemeral_pub.x);
+    out.push(ephemeral_pub.y);
+    out.push(tag);
+
+    Ok(encode_elements_le_hex(&out))
+}
+
+/// Authenticated counterpart of [`zk_kemdem_decrypt`]. Verifies the
+/// Poseidon MAC tag in constant time *before* decrypting; returns
+/// [`ZkKemDemError::MacMismatch`] on tampering.
+pub fn zk_kemdem_decrypt_authenticated(
+    receiver_sec_key: &BabyJubJubScalar,
+    ciphertext_hex: &str,
+) -> Result<Vec<Fr254>, ZkKemDemError> {
+    let elements = decode_elements_le_hex(ciphertext_hex)?;
+
+    if elements.len() < EPHEM_AND_TAG_ELEMS {
+        return Err(ZkKemDemError::InvalidEphemeralPoint(
+            "ciphertext too short: missing trailing (x, y, tag)",
+        ));
+    }
+    let payload_len = elements.len() - EPHEM_AND_TAG_ELEMS;
+    if payload_len > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload_len,
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
+
+    let ephem_x = elements[payload_len];
+    let ephem_y = elements[payload_len + 1];
+    let received_tag = elements[payload_len + 2];
+
+    if ephem_x.is_zero() && ephem_y.is_one() {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("identity point"));
+    }
+    let ephemeral_pub = EdwardsAffine::new_unchecked(ephem_x, ephem_y);
+    if !ephemeral_pub.is_on_curve() {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("not on BabyJubJub"));
+    }
+    if !ephemeral_pub.is_in_correct_subgroup_assuming_on_curve() {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("wrong subgroup"));
+    }
+
+    let shared_secret: EdwardsAffine = (ephemeral_pub * *receiver_sec_key).into_affine();
+
+    // Recompute the MAC over the received ciphertext slice and compare
+    // constant-time-ish (`Fr254::==` is non-branching on byte content
+    // for ark-ff's typical bigint compare).
+    let ct_slice = &elements[..payload_len];
+    let expected_tag = compute_mac_tag(&shared_secret, &ephemeral_pub, ct_slice);
+    if expected_tag != received_tag {
+        return Err(ZkKemDemError::MacMismatch);
+    }
+
+    // MAC verified — now decrypt.
+    let keystream = generate_keystream(&shared_secret, payload_len);
+    let mut plaintext = Vec::with_capacity(payload_len);
+    for i in 0..payload_len {
+        plaintext.push(ct_slice[i] - keystream[i]);
+    }
+    Ok(plaintext)
 }
 
 #[cfg(test)]

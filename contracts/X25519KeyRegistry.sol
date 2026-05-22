@@ -84,6 +84,10 @@ contract X25519KeyRegistry {
     error Expired();
     error InvalidAddress();
     error InvalidSignature();
+    /// The latest version pointer points at a revoked record. The
+    /// account must `register` a fresh (higher) version before
+    /// `getLatest` will return a usable key again.
+    error LatestRevoked(uint32 latestVersion);
 
     // ─── Constructor ─────────────────────────────────────────────
 
@@ -185,7 +189,11 @@ contract X25519KeyRegistry {
         uint32 v = latestVersion[account];
         if (v == 0) revert UnknownVersion();
         r = _records[account][v];
-        if (r.registeredAt == 0 || r.revoked) revert UnknownVersion();
+        if (r.registeredAt == 0) revert UnknownVersion();
+        // Distinguish "never registered" from "latest is revoked" so
+        // clients can render a helpful "your key was revoked, please
+        // re-register" message instead of a generic "unknown account".
+        if (r.revoked) revert LatestRevoked(v);
     }
 
     /// Returns the record for a specific version. May be a zero
@@ -275,9 +283,17 @@ contract X25519KeyRegistry {
                     sig
                 )
             );
-            return ok
-                && result.length >= 32
-                && abi.decode(result, (bytes4)) == 0x1626ba7e;
+            if (!ok || result.length < 32) return false;
+            // Read the first 32-byte word directly. `abi.decode(_, (bytes4))`
+            // strictly requires the low 28 bytes of the word to be zero
+            // padding and *reverts* otherwise — a malformed wallet could
+            // then halt the entire transaction. Pulling the magic value
+            // out by hand turns that into a graceful `false`.
+            bytes4 magic;
+            assembly {
+                magic := mload(add(result, 32))
+            }
+            return magic == bytes4(0x1626ba7e);
         }
 
         // EOA → ECDSA. Enforce 65‑byte form and low‑s.
@@ -291,6 +307,14 @@ contract X25519KeyRegistry {
             s := calldataload(add(sig.offset, 32))
             v := byte(0, calldataload(add(sig.offset, 64)))
         }
+        // Reject degenerate (r, s). `ecrecover` already returns
+        // address(0) for r = 0 and s = 0, which the recovered != 0
+        // check below would catch — but doing the test explicitly
+        // (a) documents intent, (b) guards against any future EVM
+        // behaviour drift in the precompile, and (c) makes the
+        // failure path observable in tests without depending on a
+        // specific signer-address comparison.
+        if (uint256(r) == 0 || uint256(s) == 0) return false;
         if (uint256(s) > HALF_N) return false;            // EIP‑2 malleability guard
         if (v < 27) v += 27;
         if (v != 27 && v != 28) return false;

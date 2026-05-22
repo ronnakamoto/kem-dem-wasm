@@ -166,6 +166,25 @@ pub fn canonicalise_secp256k1_signature(sig: &[u8]) -> Result<[u8; 65], CryptoEr
 /// `keccak256(SIG_IKM_DOMAIN ‖ canonical_sig)`. The domain separator
 /// prevents collision with any other library that hashes the raw
 /// signature for its own purposes.
+///
+/// # ⚠️ Determinism requirement
+///
+/// This whole derivation pipeline is **only secure for the user** if
+/// the signer always produces the *same* signature for the *same*
+/// message. Modern software wallets (MetaMask, Rabby, Frame, ethers,
+/// viem) all sign deterministically per RFC 6979, so this holds in
+/// practice. **However:**
+///
+/// - Some hardware wallets (older Trezor firmware, custom HSMs) may
+///   randomise the `k` nonce. Signing the same message twice yields
+///   two different signatures and therefore two different encryption
+///   keys, locking the user out of past ciphertexts.
+/// - The low-s canonicalisation collapses the malleability axis, but
+///   does **not** repair non-deterministic `k`.
+///
+/// Callers SHOULD use [`verify_signature_derivation_is_deterministic`]
+/// (or an equivalent JS-side double-derive check) before persisting
+/// any ciphertext under the resulting keypair.
 pub fn derive_ikm_from_signature(sig: &[u8]) -> Result<[u8; 32], CryptoError> {
     use sha3::{Digest, Keccak256};
     let mut canonical = canonicalise_secp256k1_signature(sig)?;
@@ -177,6 +196,42 @@ pub fn derive_ikm_from_signature(sig: &[u8]) -> Result<[u8; 32], CryptoError> {
 
     canonical.zeroize();
     Ok(result)
+}
+
+/// Checks whether two signatures over the *same* canonical derivation
+/// message produce the *same* IKM. Returns `Ok(())` if they do; an
+/// error otherwise.
+///
+/// JS callers should prompt the wallet twice for the derivation
+/// signature on first use, then call this. A mismatch indicates the
+/// signer is non-deterministic (randomised `k`) and must NOT be used
+/// to derive an encryption key — the user would lose access to past
+/// ciphertexts the next time they re-sign.
+///
+/// Note: this only checks the IKM stage, which is the part affected
+/// by signer determinism. The subsequent HKDF and X25519 derivation
+/// are pure functions of the IKM, so IKM-equal ⇒ keypair-equal.
+pub fn verify_signature_derivation_is_deterministic(
+    sig_a: &[u8],
+    sig_b: &[u8],
+) -> Result<(), CryptoError> {
+    let ikm_a = derive_ikm_from_signature(sig_a)?;
+    let ikm_b = derive_ikm_from_signature(sig_b)?;
+    // Constant-time compare to avoid leaking which byte mismatched —
+    // the IKM is secret-equivalent.
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= ikm_a[i] ^ ikm_b[i];
+    }
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err(CryptoError::new(
+            "signer is non-deterministic (two signatures over the same message produced \
+             different IKMs); derived encryption key would change on every sign"
+                .into(),
+        ))
+    }
 }
 
 /// Big-endian compare of two equal-length byte slices.
