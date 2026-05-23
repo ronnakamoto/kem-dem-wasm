@@ -4,9 +4,20 @@ use hpke::{
     kem::{Kem as KemTrait, X25519HkdfSha256},
     setup_receiver, setup_sender, Deserializable, OpModeR, OpModeS, Serializable,
 };
-use rand::{rngs::StdRng, SeedableRng};
+use rand::rand_core::UnwrapErr;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 
 use crate::error::CryptoError;
+
+/// Zero-cost wrapper around `OsRng` that implements infallible
+/// `RngCore + CryptoRng`, suitable for direct use with hpke. Each call
+/// delegates straight to `getrandom`; there is no internal state or
+/// per-call seeding work.
+#[inline]
+fn os_rng() -> UnwrapErr<OsRng> {
+    OsRng.unwrap_err()
+}
 
 pub type HpkeKem = X25519HkdfSha256;
 pub type HpkeAead = AesGcm256;
@@ -51,7 +62,11 @@ impl X25519Hpke {
     }
 
     pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
-        let mut rng = StdRng::from_os_rng();
+        // `OsRng` (rand_core 0.9) is a zero-sized type that delegates
+        // every draw to `getrandom`; wrap it once with `UnwrapErr` to
+        // satisfy hpke's infallible `RngCore` bound. No per-call
+        // seeding cost, unlike the previous `StdRng::from_os_rng()`.
+        let mut rng = os_rng();
         let (secret_key, public_key) = HpkeKem::gen_keypair(&mut rng);
         (
             public_key.to_bytes().as_slice().to_vec(),
@@ -64,7 +79,7 @@ impl X25519Hpke {
         info: &[u8],
     ) -> Result<(Vec<u8>, SenderContext), CryptoError> {
         let recipient_public_key = HpkePublicKey::from_bytes(recipient_public_key)?;
-        let mut rng = StdRng::from_os_rng();
+        let mut rng = os_rng();
         let (encapped_key, context) = setup_sender::<HpkeAead, HpkeKdf, HpkeKem, _>(
             &OpModeS::Base,
             &recipient_public_key,

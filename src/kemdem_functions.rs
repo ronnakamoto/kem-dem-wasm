@@ -37,6 +37,7 @@ use ark_ff::{BigInteger, One, PrimeField, Zero};
 use light_poseidon::{Poseidon, PoseidonHasher};
 use std::fmt;
 use std::ops::Add;
+use subtle::ConstantTimeEq;
 use taceo_ark_babyjubjub::{EdwardsAffine, EdwardsProjective, Fr as BabyJubJubScalar};
 
 /// Structured errors from the ZK KEM-DEM. Distinguishing `RetryNeeded`
@@ -208,6 +209,22 @@ fn generate_keystream(shared_secret: &EdwardsAffine, count: usize) -> Vec<Fr254>
         stream.push(h);
     }
     stream
+}
+
+/// Constant-time equality check for two BN254 `Fr` elements.
+///
+/// Both sides are lowered to their canonical 32-byte little-endian
+/// representation and compared via `subtle::ConstantTimeEq`. The
+/// resulting branch on the returned `bool` is acceptable: the boolean
+/// itself was derived in constant time, so an attacker cannot learn
+/// *where* the tags differ, only that they differ.
+#[inline]
+fn fr_ct_eq(a: &Fr254, b: &Fr254) -> bool {
+    let mut a_bytes = a.into_bigint().to_bytes_le();
+    let mut b_bytes = b.into_bigint().to_bytes_le();
+    a_bytes.resize(FR_BYTES, 0);
+    b_bytes.resize(FR_BYTES, 0);
+    a_bytes.ct_eq(&b_bytes).into()
 }
 
 fn encode_elements_le_hex(elements: &[Fr254]) -> String {
@@ -420,11 +437,15 @@ pub fn zk_kemdem_decrypt_authenticated(
     let shared_secret: EdwardsAffine = (ephemeral_pub * *receiver_sec_key).into_affine();
 
     // Recompute the MAC over the received ciphertext slice and compare
-    // constant-time-ish (`Fr254::==` is non-branching on byte content
-    // for ark-ff's typical bigint compare).
+    // the canonical little-endian byte form in constant time. `ark-ff`
+    // makes NO timing guarantees on `PartialEq` for `Fr` elements, so
+    // we lower both tags to their fixed-size byte representation and
+    // use `subtle::ConstantTimeEq` to avoid leaking which byte differs
+    // (which would otherwise allow a forgery-by-timing attack on the
+    // tag).
     let ct_slice = &elements[..payload_len];
     let expected_tag = compute_mac_tag(&shared_secret, &ephemeral_pub, ct_slice);
-    if expected_tag != received_tag {
+    if !fr_ct_eq(&expected_tag, &received_tag) {
         return Err(ZkKemDemError::MacMismatch);
     }
 

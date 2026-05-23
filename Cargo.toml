@@ -7,8 +7,20 @@ description = "WASM KEM-DEM hybrid encryption with flexible field support and a 
 repository = "https://github.com/ronnakamoto/kem-dem-wasm"
 license = "MIT OR Apache-2.0"
 
+# Enable wasm-opt with size-oriented passes. `-Os` is the standard
+# size-vs-speed trade-off. The `--enable-*` flags allow the WASM
+# features that rustc 1.82+ emits by default for wasm32-unknown-unknown
+# (without these, wasm-opt's validator refuses to load the input).
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = [
+    "-Os",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+    "--enable-reference-types",
+    "--enable-multivalue",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -30,6 +42,7 @@ sha2 = "0.10"
 sha3 = "0.10"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 zeroize = { version = "1", features = ["derive"] }
+subtle = { version = "2.6", default-features = false }
 ark-bn254 = { version = "0.5", default-features = false }
 ark-ff = { version = "0.5", default-features = false }
 ark-ec = { version = "0.5", default-features = false }
