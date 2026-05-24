@@ -132,6 +132,13 @@ const kp = kemDem.deriveKeypairFromIkm(ikm, addr)
 // One-time signature prompt (EIP-712 typed data when available; falls back to personal_sign)
 const chainId = Number(BigInt(await provider.request({ method: 'eth_chainId' })))
 const path = KemDem.encryptionDerivationPath()
+// NOTE: this typed-data payload is *only* used to derive a local
+// encryption key via `deriveKeypairFromSignature`. There is no
+// on-chain verifier, so the EIP-712 domain intentionally omits
+// `verifyingContract`. Do NOT copy this snippet for the
+// X25519KeyRegistry's `registerFor` path — that signature uses the
+// registry's own EIP-712 domain (which DOES include
+// `verifyingContract`) defined inside the contract.
 const typedData = {
   types: {
     EIP712Domain: [
@@ -277,6 +284,8 @@ registry.revoke(version);  // Only msg.sender can revoke their own keys
 
 Revoked version slots are permanently dead — the account must register with a fresh version number.
 
+> **`getLatest` semantics after revocation:** `revoke` does **not** roll `latestVersion` back. If the latest version of an account is revoked and no higher version has been registered, `getLatest` reverts with `LatestRevoked(uint32 latestVersion)`. Sender clients **must** catch this error and surface a "key was revoked, please re-register" message rather than treating the account as never having registered (which `UnknownVersion` would imply). This is deliberate — silently scanning backwards for an older active version would defeat the purpose of revocation.
+
 ### Lookups
 
 ```solidity
@@ -328,12 +337,23 @@ const payload = [
   '0x0000000000000000000000000000000000000000000000000000000000000002',
 ]
 
-const ciphertext = ZkEncryptor.encrypt(kp.publicKey.x, kp.publicKey.y, payload)
-// ciphertext → hex string, length = (payload.length + 2) * 64
+// ── Authenticated (recommended for anything outside a SNARK that
+//    itself enforces integrity). Includes a Poseidon MAC tag.
+const ctAuth = ZkEncryptor.encryptAuthenticated(
+  kp.publicKey.x, kp.publicKey.y, payload,
+)
+// ctAuth → hex string, length = (payload.length + 3) * 64
 
-// Decrypt back to Fr element hex strings
-const decrypted = ZkEncryptor.decrypt(kp.secretKey, ciphertext)
-// decrypted → ["0x...", "0x..."]  (same length as payload)
+const ptAuth = ZkEncryptor.decryptAuthenticated(kp.secretKey, ctAuth)
+// ptAuth → ["0x...", "0x..."]  (throws if the MAC tag does not verify)
+
+// ── Confidentiality-only (use only when an enclosing SNARK or
+//    other channel guarantees integrity).
+const ct = ZkEncryptor.encrypt(kp.publicKey.x, kp.publicKey.y, payload)
+// ct → hex string, length = (payload.length + 2) * 64
+
+const pt = ZkEncryptor.decrypt(kp.secretKey, ct)
+// pt → ["0x...", "0x..."]
 ```
 
 ### Use Cases
@@ -344,8 +364,9 @@ const decrypted = ZkEncryptor.decrypt(kp.secretKey, ciphertext)
 
 ### Security Notes
 
-- The KEM uses a random ephemeral scalar `r` per encryption. Reusing `r` leaks the payload.
-- The DEM is a simple additive stream cipher (XOR in the field). It provides confidentiality but **no authentication**. If you need ciphertext integrity, wrap the output with an additional MAC or use the HPKE API for non-ZK data.
+- **Prefer `encryptAuthenticated`/`decryptAuthenticated`** for any data that is not consumed inside a SNARK that itself enforces integrity. The authenticated variant appends a Poseidon MAC tag bound to the shared secret and the ephemeral public key, and the decrypt path verifies the tag in constant time before returning plaintext.
+- The KEM uses a fresh random ephemeral scalar `r` per encryption. Reusing `r` leaks the payload.
+- The unauthenticated `encrypt`/`decrypt` DEM is a Poseidon-derived stream cipher (addition in the field). It provides confidentiality but **no authentication**, so a bit-flip in the ciphertext flips the corresponding plaintext bit silently. Only use it when an enclosing SNARK or other channel guarantees integrity; otherwise use the authenticated variant or the HPKE API.
 - The ciphertext stores the ephemeral public key uncompressed `(x, y)` to avoid expensive point decompression inside circuits.
 
 ## License

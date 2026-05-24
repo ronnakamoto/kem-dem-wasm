@@ -3,9 +3,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::hex_util::{
-    fill_random, fr_to_be_hex, js_err, parse_babyjubjub_scalar_be, parse_fr_be,
-};
+use crate::hex_util::{fill_random, fr_to_be_hex, js_err, parse_babyjubjub_scalar_be, parse_fr_be};
 
 /// ZK-friendly encryptor using a BabyJubJub KEM-DEM over the BN254
 /// scalar field `Fr`.
@@ -35,9 +33,7 @@ impl ZkEncryptor {
         let x = parse_fr_be(receiver_pub_x_hex).map_err(js_err)?;
         let y = parse_fr_be(receiver_pub_y_hex).map_err(js_err)?;
         let receiver_pub = point_from_xy(x, y).ok_or_else(|| {
-            js_err(
-                "receiver public key is invalid: identity, off-curve, or wrong subgroup",
-            )
+            js_err("receiver public key is invalid: identity, off-curve, or wrong subgroup")
         })?;
 
         let mut payload = Vec::with_capacity(payload_hex_array.len());
@@ -179,7 +175,10 @@ impl ZkEncryptor {
         // BabyJubJub scalar field is 251 bits → `to_bytes_be` always
         // fits in 32 bytes; just left-pad to a fixed width.
         let be = sk.into_bigint().to_bytes_be();
-        debug_assert!(be.len() <= 32, "BabyJubJub scalar must encode in ≤ 32 bytes");
+        debug_assert!(
+            be.len() <= 32,
+            "BabyJubJub scalar must encode in ≤ 32 bytes"
+        );
         let mut sk_bytes = vec![0u8; 32];
         sk_bytes[32 - be.len()..].copy_from_slice(&be);
 
@@ -218,8 +217,6 @@ impl ZkEncryptor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn zk_generated_keypair_is_valid_and_roundtrips() {
         use crate::kemdem_functions::{
@@ -335,13 +332,16 @@ mod tests {
         let (_, pk) = generate_keypair_from_seed([17u8; 32]).unwrap();
         let payload = vec![Fr254::from(1u64); 4];
         let ct = zk_kemdem_encrypt_authenticated([18u8; 32], &pk, &payload).unwrap();
-        assert_eq!(ct.len(), (payload.len() + EPHEM_AND_TAG_ELEMS) * FR_BYTES * 2);
+        assert_eq!(
+            ct.len(),
+            (payload.len() + EPHEM_AND_TAG_ELEMS) * FR_BYTES * 2
+        );
     }
 
     #[test]
     fn zk_encrypt_payload_too_large_is_typed_error() {
         use crate::kemdem_functions::{
-            generate_keypair_from_seed, zk_kemdem_encrypt, MAX_PAYLOAD_ELEMS, ZkKemDemError,
+            generate_keypair_from_seed, zk_kemdem_encrypt, ZkKemDemError, MAX_PAYLOAD_ELEMS,
         };
         use ark_bn254::Fr as Fr254;
 

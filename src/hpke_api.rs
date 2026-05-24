@@ -138,8 +138,7 @@ impl KemDem {
         // package. If the sender's set differs in any way (added,
         // dropped, renamed field) the AAD mismatch will cause every
         // AEAD `open` below to fail.
-        let manifest =
-            manifest_hash(package.encrypted_fields.keys().map(String::as_str));
+        let manifest = manifest_hash(package.encrypted_fields.keys().map(String::as_str));
 
         let decrypted_fields = js_sys::Object::new();
         for (field_name, field_ct) in &package.encrypted_fields {
@@ -297,8 +296,7 @@ impl EncryptedPackage {
     #[wasm_bindgen(constructor)]
     pub fn new(kem_ciphertext: &[u8], encrypted_fields: JsValue) -> Result<Self, JsValue> {
         use hpke::{kem::Kem as KemTrait, Serializable};
-        let expected_len =
-            <<crate::kem::HpkeKem as KemTrait>::EncappedKey as Serializable>::size();
+        let expected_len = <<crate::kem::HpkeKem as KemTrait>::EncappedKey as Serializable>::size();
         if kem_ciphertext.len() != expected_len {
             return Err(to_js_value(CryptoError::new(format!(
                 "kem_ciphertext length {} does not match HPKE encapped-key size of {expected_len} bytes",
@@ -313,6 +311,21 @@ impl EncryptedPackage {
                 "field count {} exceeds maximum of {MAX_FIELD_COUNT}",
                 fields.len()
             ))));
+        }
+        // Per-ciphertext cap: ciphertext = plaintext + AES-GCM tag.
+        // We allow `MAX_FIELD_VALUE_LEN + AEAD_TAG_LEN` so any value
+        // that round-trips through `encrypt_fields` is acceptable here,
+        // and reject anything larger to bound WASM heap allocation
+        // when loading a stored / attacker-supplied package.
+        const AEAD_TAG_LEN: usize = 16; // AES-GCM-256 tag
+        let max_ct_len = MAX_FIELD_VALUE_LEN + AEAD_TAG_LEN;
+        for (name, ct) in &fields {
+            if ct.len() > max_ct_len {
+                return Err(to_js_value(CryptoError::new(format!(
+                    "field '{name}' ciphertext of {} bytes exceeds maximum of {max_ct_len}",
+                    ct.len()
+                ))));
+            }
         }
         Ok(Self {
             encapped_key: kem_ciphertext.to_vec(),
@@ -403,8 +416,7 @@ impl EncryptedBlob {
 /// preventing a `("ab", manifest_for_X)` AAD from being confused with
 /// `("a", b ‖ manifest_for_X)`.
 pub(crate) fn field_aad(field_name: &str, manifest: &[u8; 32]) -> Vec<u8> {
-    let mut aad =
-        Vec::with_capacity(FIELD_PACKAGE_AAD_PREFIX.len() + field_name.len() + 1 + 32);
+    let mut aad = Vec::with_capacity(FIELD_PACKAGE_AAD_PREFIX.len() + field_name.len() + 1 + 32);
     aad.extend_from_slice(FIELD_PACKAGE_AAD_PREFIX);
     aad.extend_from_slice(field_name.as_bytes());
     aad.push(0x00);
@@ -432,11 +444,16 @@ pub(crate) fn manifest_hash<'a, I: Iterator<Item = &'a str>>(field_names: I) -> 
 
 // ── Native-only inner helpers (no `JsValue`, usable from `cargo test --lib`) ──
 
+/// `(encapped_key, field_name -> ciphertext)` produced by the
+/// test-only native field encryptor.
+#[cfg(test)]
+type SealedFields = (Vec<u8>, BTreeMap<String, Vec<u8>>);
+
 #[cfg(test)]
 pub(crate) fn encrypt_fields_native(
     public_key: &[u8],
     input_map: &BTreeMap<String, Vec<u8>>,
-) -> Result<(Vec<u8>, BTreeMap<String, Vec<u8>>), CryptoError> {
+) -> Result<SealedFields, CryptoError> {
     let (encapped_key, mut sender) = X25519Hpke::setup_sender(public_key, FIELD_PACKAGE_INFO)?;
     let manifest = manifest_hash(input_map.keys().map(String::as_str));
     let mut out = BTreeMap::new();
@@ -710,12 +727,13 @@ mod native_tests {
         assert_eq!(FIELD_PACKAGE_INFO, b"kem-dem-wasm/v2/field-package");
     }
 
-    #[test]
-    fn manifest_constants_are_sensible() {
-        assert!(MAX_FIELD_COUNT >= 1024);
-        assert!(MAX_FIELD_VALUE_LEN >= 1024);
-        assert!((MAX_FIELD_COUNT as u64) * (MAX_FIELD_VALUE_LEN as u64) <= (1u64 << 40));
-    }
+    // The caps must be large enough for normal use but not so large
+    // that a malicious caller can OOM the WASM heap before the
+    // explicit checks fire. Enforced at compile time so anyone who
+    // bumps a constant into a pathological range gets a build error.
+    const _: () = assert!(MAX_FIELD_COUNT >= 1024);
+    const _: () = assert!(MAX_FIELD_VALUE_LEN >= 1024);
+    const _: () = assert!((MAX_FIELD_COUNT as u64) * (MAX_FIELD_VALUE_LEN as u64) <= (1u64 << 40));
 
     #[test]
     fn hpke_encapped_key_size_is_32() {
@@ -765,8 +783,7 @@ mod native_tests {
         let mut sig_b = [0u8; 65];
         sig_b[63] = 0x43;
         sig_b[64] = 27;
-        let err =
-            verify_signature_derivation_is_deterministic(&sig_a, &sig_b).unwrap_err();
+        let err = verify_signature_derivation_is_deterministic(&sig_a, &sig_b).unwrap_err();
         assert!(
             err.to_string().contains("non-deterministic"),
             "error must clearly flag non-determinism, got: {err}"
@@ -775,13 +792,11 @@ mod native_tests {
 
     #[test]
     fn malleable_pair_still_passes_check() {
-        use crate::derive::{
-            verify_signature_derivation_is_deterministic, SIG_IKM_DOMAIN,
-        };
+        use crate::derive::{verify_signature_derivation_is_deterministic, SIG_IKM_DOMAIN};
         const SECP256K1_N: [u8; 32] = [
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2,
-            0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
         ];
 
         let mut low = [0u8; 65];

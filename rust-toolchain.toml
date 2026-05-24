@@ -1,0 +1,9 @@
+[toolchain]
+# Pin the compiler so CI and reproduces of the pinned test vectors
+# (HKDF salt, derivation pinned-vector, Poseidon keystream pinned
+# vector) always use the same version. Bump deliberately when you
+# verify the vectors still match.
+channel    = "1.86"
+components = ["rustfmt", "clippy"]
+targets    = ["wasm32-unknown-unknown"]
+profile    = "minimal"

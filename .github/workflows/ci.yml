@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  # ── Fast checks: fmt, clippy, native unit tests ────────────────
+  rust:
+    name: Rust (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain version, components and target are all pinned
+      # in `rust-toolchain.toml`; this action just respects that file.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry, index and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --lib -- -D warnings
+
+      - name: cargo test --lib
+        run: cargo test --lib --verbose
+
+      - name: cargo check (wasm32-unknown-unknown)
+        run: cargo check --lib --target wasm32-unknown-unknown
+
+  # ── Headless browser test pass for the WASM bindings ──────────
+  wasm:
+    name: wasm-pack (headless chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Build WASM (web + nodejs targets)
+        run: |
+          wasm-pack build --target web    --out-dir pkg
+          wasm-pack build --target nodejs --out-dir pkg-node
+
+      - name: WASM browser tests
+        run: wasm-pack test --headless --chrome
+
+  # ── Security advisories against the lockfile ──────────────────
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    continue-on-error: true # advisories shouldn't block merging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Solidity contract tests via Foundry ───────────────────────
+  forge:
+    name: Foundry (forge test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: forge build
+        run: forge build --root contracts
+
+      - name: forge test
+        run: forge test --root contracts -vv

@@ -79,9 +79,9 @@ impl fmt::Display for ZkKemDemError {
                 write!(f, "invalid ephemeral public key: {s}")
             }
             ZkKemDemError::InvalidHex(s) => write!(f, "invalid ciphertext hex: {s}"),
-            ZkKemDemError::MacMismatch => f.write_str(
-                "authenticated ciphertext failed integrity check (MAC mismatch)",
-            ),
+            ZkKemDemError::MacMismatch => {
+                f.write_str("authenticated ciphertext failed integrity check (MAC mismatch)")
+            }
         }
     }
 }
@@ -172,9 +172,7 @@ pub fn zk_kemdem_decrypt(
     }
     let ephemeral_pub = EdwardsAffine::new_unchecked(ephem_x, ephem_y);
     if !ephemeral_pub.is_on_curve() {
-        return Err(ZkKemDemError::InvalidEphemeralPoint(
-            "not on BabyJubJub",
-        ));
+        return Err(ZkKemDemError::InvalidEphemeralPoint("not on BabyJubJub"));
     }
     if !ephemeral_pub.is_in_correct_subgroup_assuming_on_curve() {
         return Err(ZkKemDemError::InvalidEphemeralPoint("wrong subgroup"));
