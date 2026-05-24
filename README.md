@@ -42,6 +42,9 @@ npm install kem-dem-wasm
 ```bash
 # Build for web (browser/Vite)
 wasm-pack build --target web --out-dir pkg
+
+# Build for Node.js (scripts / Circom input generation)
+wasm-pack build --target nodejs --out-dir pkg-node
 ```
 
 ### Run Tests
@@ -177,6 +180,28 @@ const kp = kemDem.deriveKeypairFromSignature(sig, addr)
 
 > **Hardware wallet note**: Hardware wallets (Ledger, Trezor) cannot natively derive X25519 keys. Use Option B (sign-to-derive) for hardware wallet users. The encryption secret key will live in software on the host.
 
+#### Signer Determinism Self-Check
+
+Before using a wallet for sign-to-derive, verify that it signs deterministically (RFC 6979). A non-deterministic signer produces a different key every time, which would lock the user out of past ciphertexts.
+
+```javascript
+// Prompt the wallet twice for the same derivation message
+const sigA = await provider.request({
+  method: 'personal_sign',
+  params: ['kem-dem-wasm/v1/derive-encryption-key', signerAddress],
+})
+const sigB = await provider.request({
+  method: 'personal_sign',
+  params: ['kem-dem-wasm/v1/derive-encryption-key', signerAddress],
+})
+
+// Throws if the signer is non-deterministic
+KemDem.verifySignerIsDeterministic(
+  getBytes(sigA),
+  getBytes(sigB),
+)
+```
+
 ### On-chain Key Registry
 
 Once a user has derived their X25519 public key, they need a way to **publish it** so that other parties can encrypt to them just from their EVM address. The repo ships a minimal Solidity registry at [`contracts/X25519KeyRegistry.sol`](contracts/X25519KeyRegistry.sol).
@@ -221,7 +246,7 @@ To rotate, derive a v2 keypair (e.g. via a `v2` info string) and call `registry.
 
 1. **Standardized KEM-DEM**: Uses HPKE (RFC 9180) instead of a custom construction. The key schedule, nonce derivation, and context binding are all handled by the standard.
 2. **Deterministic field order**: Fields are encrypted and decrypted in sorted `BTreeMap` order, eliminating `HashMap` iteration nondeterminism.
-3. **Per-field AAD**: Each field name is authenticated as AAD (`kem-dem-wasm/v1/field:<name>`), preventing cross-field ciphertext replay.
+3. **Per-field AAD with manifest binding (v2)**: Each field name is authenticated as AAD (`kem-dem-wasm/v2/field:<name>\x00<manifest>`), and the sorted field-name set is bound into a manifest hash that is mixed into every field's AAD. This prevents cross-field ciphertext replay, silent field drops, field additions, and field renames. v1 ciphertexts are intentionally not decryptable by v2.
 4. **Memory safety**: Secret keys use `zeroize` in Rust, though they are still exposed to JS GC once returned to the browser.
 
 ## Example App

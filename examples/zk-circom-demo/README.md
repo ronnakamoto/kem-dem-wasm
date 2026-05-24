@@ -123,11 +123,20 @@ const ciphertext = ZkEncryptor.encrypt(kp.publicKey.x, kp.publicKey.y, vote)
 //    The ciphertext is public — anyone can see it, but no one can decrypt without the secret key
 ```
 
-The demo script `scripts/generate-input.js` loads the Node-target build from `pkg-node/` and produces a ciphertext whose wire-format is a hex string encoding 32-byte little-endian BN254 `Fr` elements:
+The demo script `scripts/generate-input.js` loads the Node-target build from `pkg-node/` and produces a ciphertext whose wire-format is a hex string encoding 32-byte little-endian BN254 `Fr` elements.
 
-```
-[ct_0] [ct_1] ... [ct_n] [ephem_x] [ephem_y]
-```
+> **Note on authentication**: The Circom circuit in this demo verifies
+> confidentiality only (keystream subtraction). For production use cases
+> that need integrity, use `ZkEncryptor.encryptAuthenticated` /
+> `decryptAuthenticated`. The authenticated variant appends a Poseidon MAC
+> tag and verifies it before decrypting. The wire format then becomes:
+>
+> ```
+> [ct_0] [ct_1] ... [ct_n] [ephem_x] [ephem_y] [tag]
+> ```
+>
+> Total size: `(n + 3) * 32` bytes. The MAC computation is documented in
+> `docs/test-vectors.md` (Part D).
 
 ### In-Circuit (Circom)
 
@@ -162,7 +171,7 @@ require(valid, "Invalid proof");
 ## Security Notes
 
 - **This is a demo**: The circuit is minimal and focused on proving correctness of decryption and the vote policy. A production circuit would need a full hardened BabyJubJub gadget set and careful constraints review.
-- **No authentication**: The KEM-DEM provides confidentiality but not integrity. For production, add a MAC or use the HPKE API for non-ZK data.
+- **Authentication available**: The library provides `ZkEncryptor.encryptAuthenticated` / `decryptAuthenticated` for integrity. The Circom circuit in this demo does not verify the MAC tag; it only proves confidentiality. For production, either extend the circuit to verify the Poseidon MAC or use the authenticated decrypt path off-chain before feeding the plaintext into a circuit.
 - **Trusted setup**: The Groth16 trusted setup in this demo is for testing only. Production requires a multi-party computation (MPC) ceremony.
 
 ## Next Steps

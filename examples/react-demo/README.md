@@ -61,7 +61,7 @@ npm run build
 
 - **KEM**: DHKEM(X25519, HKDF-SHA256) via the `hpke` crate (RFC 9180)
 - **DEM**: AES-256-GCM via HPKE's built-in AEAD context
-- **Field binding**: Per-field AAD (`kem-dem-wasm/v1/field:<name>`)
+- **Field binding**: Per-field AAD (`kem-dem-wasm/v2/field:<name>\x00<manifest>`) with a manifest hash binding the sorted field-name set, preventing field drops, additions, and renames
 - **Deterministic order**: Fields are processed in sorted order (BTreeMap) for reproducibility
 
 ### ZK Mode
