@@ -25,7 +25,7 @@ function hexToBytes(hex) {
   return bytes
 }
 
-export default function SecureForm({ kemDem, zkEncryptor }) {
+export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
   const [keys, setKeys] = useState(null)
   const [keyGenMode, setKeyGenMode] = useState('random') // 'random' | 'ikm' | 'signature'
   
@@ -270,7 +270,12 @@ export default function SecureForm({ kemDem, zkEncryptor }) {
         if (typeof xHex !== 'string' || typeof yHex !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(xHex) || !/^0x[0-9a-fA-F]{64}$/.test(yHex)) {
           throw new Error('ZK public key must be 0x-prefixed 32-byte hex (x,y)')
         }
-        const ciphertext = zkEncryptor.encrypt(xHex, yHex, payloadHex)
+        // Authenticated DEM: appends a Poseidon MAC tag bound to the
+        // shared secret and ephemeral public key. Decrypt verifies the
+        // tag in constant time before returning plaintext. Recommended
+        // for any data not consumed inside a SNARK that itself enforces
+        // integrity.
+        const ciphertext = zkEncryptor.encryptAuthenticated(xHex, yHex, payloadHex)
         setZkCiphertext(ciphertext)
         setActiveTab('zk')
         setError(null)
@@ -327,7 +332,11 @@ export default function SecureForm({ kemDem, zkEncryptor }) {
           setError('ZK keypair not available')
           return
         }
-        const decryptedFrArray = zkEncryptor.decrypt(secKey, zkCiphertext)
+        // Authenticated path: verifies the Poseidon MAC tag (constant
+        // time) before returning plaintext. Throws on tampering or
+        // wrong-key. Must match `encryptAuthenticated` used in
+        // `handleEncrypt`.
+        const decryptedFrArray = zkEncryptor.decryptAuthenticated(secKey, zkCiphertext)
         const decoded = []
         for (let i = 0; i < decryptedFrArray.length; i++) {
           const hexStr = decryptedFrArray[i]
@@ -366,14 +375,17 @@ export default function SecureForm({ kemDem, zkEncryptor }) {
       for (const [name, hex] of Object.entries(parsed.encryptedFields)) {
         encFields[name] = hexToBytes(hex)
       }
-      const pkg = kemDem.constructor.prototype.constructor.new(kemCt, encFields)
+      // Reconstruct via the wasm-bindgen `EncryptedPackage` constructor.
+      // This is the correct round-trip: serialize via `pkg.toObject()` /
+      // `bytesToHex(...)`, then rehydrate via `new EncryptedPackage(...)`.
+      const pkg = new EncryptedPackage(kemCt, encFields)
       setEncryptedPackage(pkg)
       setDecryptedData(null)
       setError(null)
     } catch (err) {
       setError('Failed to load package: ' + err.message)
     }
-  }, [serializedPackage, kemDem])
+  }, [serializedPackage, EncryptedPackage])
 
   return (
     <div className="secure-form">
@@ -750,10 +762,10 @@ export default function SecureForm({ kemDem, zkEncryptor }) {
 
           {activeTab === 'zk' && zkCiphertext && (
             <div className="result-panel">
-              <h3>ZK Ciphertext (BabyJubJub KEM-DEM)</h3>
+              <h3>ZK Ciphertext (BabyJubJub KEM-DEM, authenticated)</h3>
               <p className="hint">
                 Exactly <strong>{zkCiphertext.length} hex characters</strong> ({(zkCiphertext.length / 2)} bytes).<br/>
-                Represents {fields.length} payload Fr254 elements + 2 ephemeral key components.
+                Represents {fields.length} payload Fr254 elements + 2 ephemeral key components + 1 Poseidon MAC tag.
               </p>
               <textarea
                 className="json-editor"

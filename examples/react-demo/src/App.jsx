@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import init, { KemDem, ZkEncryptor } from 'kem-dem-wasm'
+import init, { KemDem, ZkEncryptor, EncryptedPackage } from 'kem-dem-wasm'
 import SecureForm from './components/SecureForm'
 import './App.css'
 
@@ -69,7 +69,11 @@ function App() {
         </p>
       </header>
       <main>
-        <SecureForm kemDem={kemDem} zkEncryptor={ZkEncryptor} />
+        <SecureForm
+          kemDem={kemDem}
+          zkEncryptor={ZkEncryptor}
+          EncryptedPackage={EncryptedPackage}
+        />
       </main>
       <footer className="app-footer">
         <p>

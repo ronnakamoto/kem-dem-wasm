@@ -68,8 +68,8 @@ npm run build
 
 - **Curve**: BabyJubJub (Edwards over BN254)
 - **KEM**: ElGamal-style ephemeral key exchange (`ephemeral = G * r`, `shared = pub * r`)
-- **DEM**: Poseidon-derived keystream + field addition (`ciphertext = payload + keystream`)
-- **Encoding**: inputs are 32-byte big-endian Fr hex; ciphertext is hex-encoded 32-byte little-endian Fr elements
+- **DEM**: Poseidon-derived keystream + field addition (`ciphertext = payload + keystream`) **plus a Poseidon MAC tag** bound to `shared` and `(ephem_x, ephem_y)`. The demo uses `encryptAuthenticated` / `decryptAuthenticated`; the decrypt path verifies the MAC tag in constant time before returning plaintext.
+- **Encoding**: inputs are 32-byte big-endian Fr hex; ciphertext is hex-encoded 32-byte little-endian Fr elements (`n + 3` of them: `n` payload + `ephem_x, ephem_y` + `tag`)
 
 ## Files
 
