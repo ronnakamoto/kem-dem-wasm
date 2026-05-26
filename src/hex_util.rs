@@ -113,12 +113,18 @@ where
 /// Parse a big-endian hex string into a BN254 `Fr` element, *rejecting*
 /// values ≥ the field modulus instead of silently reducing.
 pub(crate) fn parse_fr_be(s: &str) -> Result<ark_bn254::Fr, String> {
+    parse_fr_be_labeled(s, "value")
+}
+
+/// Like [`parse_fr_be`] but with a caller-supplied label for error messages
+/// (e.g. `"kem_domain"` → `"kem_domain is not a canonical field element"`).
+pub(crate) fn parse_fr_be_labeled(s: &str, label: &str) -> Result<ark_bn254::Fr, String> {
     use ark_bn254::Fr;
     use ark_ff::{BigInteger, PrimeField};
 
     parse_canonical(
         s,
-        "value",
+        label,
         /* empty_allowed */ true,
         /* big_endian   */ true,
         Fr::from_be_bytes_mod_order,

@@ -456,6 +456,413 @@ pub fn zk_kemdem_decrypt_authenticated(
     Ok(plaintext)
 }
 
+// ─── Two-level KEM-DEM with caller-supplied domain separators ────
+//
+// This extends the crate with a generic two-level KEM-DEM that any
+// protocol can use by supplying its own Poseidon domain constants and
+// choosing an EPK encoding. Any protocol sharing the same key material but
+// requiring cryptographic separation can pass its own constants.
+//
+// Wire format (both `compress_epk` variants produce `(n + 2)` elements):
+//
+//   compress_epk = false  →  [ct_0 … ct_{n-1}] [epk_x] [epk_y]
+//   compress_epk = true   →  [ct_0 … ct_{n-1}] [epk_y] [sign_flag]
+
+/// Configuration for a custom two-level KEM-DEM keystream.
+///
+/// Domain constants provide cryptographic separation between the KEM
+/// and DEM layers and — crucially — between different protocols that
+/// share the same BabyJubJub key material.
+///
+/// **Convention for deriving domain constants:**
+/// ```text
+/// kem_domain = Fr254::from_le_bytes_mod_order(SHA256("ProtocolName|PurposeKEM"))
+/// dem_domain = Fr254::from_le_bytes_mod_order(SHA256("ProtocolName|PurposeDEM"))
+/// ```
+/// Collision between two protocols' domain constants makes their
+/// ciphertexts cross-decryptable — choose unique, descriptive strings.
+pub struct KemDemDomains {
+    /// Domain separator fed into the KEM step.
+    /// `enc_key = Poseidon([shared.x, shared.y, kem_domain])`
+    pub kem_domain: Fr254,
+    /// Domain separator fed into each DEM element.
+    /// `keystream[i] = Poseidon([enc_key, dem_domain, Fr(i)])`
+    pub dem_domain: Fr254,
+}
+
+/// Two-level Poseidon keystream with caller-supplied domain separators.
+///
+/// Unlike the built-in [`generate_keystream`] (which uses a single Poseidon
+/// call per element with a **1-based** `i+1` counter — reserving counter 0
+/// for the MAC key), this function first derives an intermediate encryption
+/// key from the shared secret and a KEM domain constant, then derives each
+/// keystream element from that key using a DEM domain constant and a
+/// **0-based** counter.
+///
+/// The 0-based counter is safe here because the domain constants provide
+/// the separation that the 1-based counter provides in the single-level
+/// scheme (where counter 0 is reserved for the MAC strand).
+///
+/// This matches the pattern used by protocols that require
+/// cryptographic separation between the KEM and DEM layers.
+pub(crate) fn generate_keystream_with_domains(
+    shared_secret: &EdwardsAffine,
+    count: usize,
+    domains: &KemDemDomains,
+) -> Vec<Fr254> {
+    let mut hasher =
+        Poseidon::<Fr254>::new_circom(3).expect("circomlib Poseidon(3) parameters are bundled");
+    let enc_key = hasher
+        .hash(&[shared_secret.x, shared_secret.y, domains.kem_domain])
+        .expect("Poseidon hash over 3 Fr inputs never fails");
+    (0..count)
+        .map(|i| {
+            hasher
+                .hash(&[enc_key, domains.dem_domain, Fr254::from(i as u64)])
+                .expect("Poseidon hash over 3 Fr inputs never fails")
+        })
+        .collect()
+}
+
+/// Generic encrypt: two-level KEM-DEM with caller-supplied domain constants
+/// and configurable EPK encoding.
+///
+/// Wire format with `compress_epk = true` (compressed style):
+///   `[ct_0 … ct_{n-1}] [epk_y] [epk_x_sign_flag]`
+///
+/// Wire format with `compress_epk = false` (default style, same as `encrypt`):
+///   `[ct_0 … ct_{n-1}] [epk_x] [epk_y]`
+///
+/// **Confidentiality only.** For integrity protection, use
+/// [`zk_kemdem_encrypt_authenticated_with_domains`] or verify the
+/// ciphertext in a ZK circuit.
+pub fn zk_kemdem_encrypt_with_domains(
+    random_seed: [u8; 32],
+    receiver_pub_key: &EdwardsAffine,
+    payload: &[Fr254],
+    domains: &KemDemDomains,
+    compress_epk: bool,
+) -> Result<String, ZkKemDemError> {
+    if payload.len() > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
+    let r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
+    if r.is_zero() {
+        return Err(ZkKemDemError::RetryNeeded);
+    }
+    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
+
+    let keystream = generate_keystream_with_domains(&shared_secret, payload.len(), domains);
+    let mut elements: Vec<Fr254> = Vec::with_capacity(payload.len() + EPHEM_ELEMS);
+    for i in 0..payload.len() {
+        elements.push(payload[i] + keystream[i]);
+    }
+
+    append_epk(&mut elements, &ephemeral_pub, compress_epk);
+
+    Ok(encode_elements_le_hex(&elements))
+}
+
+/// Generic decrypt: counterpart to [`zk_kemdem_encrypt_with_domains`].
+///
+/// Set `compress_epk = true` when the ciphertext was produced with
+/// `compress_epk = true`; the last two elements are then treated as
+/// `[epk_y, sign_flag]` and the full EPK is reconstructed via Ark's
+/// compressed-point deserialiser.
+pub fn zk_kemdem_decrypt_with_domains(
+    receiver_sec_key: &BabyJubJubScalar,
+    ciphertext_hex: &str,
+    domains: &KemDemDomains,
+    compress_epk: bool,
+) -> Result<Vec<Fr254>, ZkKemDemError> {
+    let elements = decode_elements_le_hex(ciphertext_hex)?;
+    if elements.len() < EPHEM_ELEMS {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("ciphertext too short"));
+    }
+    let payload_len = elements.len() - EPHEM_ELEMS;
+    if payload_len > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload_len,
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
+
+    let ephemeral_pub = decode_epk(&elements, payload_len, compress_epk)?;
+
+    let shared_secret: EdwardsAffine = (ephemeral_pub * *receiver_sec_key).into_affine();
+    let keystream = generate_keystream_with_domains(&shared_secret, payload_len, domains);
+
+    Ok((0..payload_len)
+        .map(|i| elements[i] - keystream[i])
+        .collect())
+}
+
+// ─── Shared EPK encoding/decoding helpers ────────────────────────
+//
+// Both the unauthenticated and authenticated domain-separated
+// variants need to encode/decode the ephemeral public key in the
+// same way.  These helpers centralise that logic.
+
+/// Append the ephemeral public key to `elements` in either compressed
+/// or uncompressed form.
+fn append_epk(elements: &mut Vec<Fr254>, ephemeral_pub: &EdwardsAffine, compress: bool) {
+    if compress {
+        // Compressed: [epk_y, sign_flag]
+        // sign_flag = Fr254::one() if epk.x > -epk.x in canonical BigInteger
+        // representation (matches Ark's compressed-point convention).
+        let neg_x = -ephemeral_pub.x;
+        let sign_flag = if ephemeral_pub.x.into_bigint() > neg_x.into_bigint() {
+            Fr254::one()
+        } else {
+            Fr254::zero()
+        };
+        elements.push(ephemeral_pub.y);
+        elements.push(sign_flag);
+    } else {
+        // Uncompressed: [epk_x, epk_y]  (same as the standard encrypt)
+        elements.push(ephemeral_pub.x);
+        elements.push(ephemeral_pub.y);
+    }
+}
+
+/// Decode the ephemeral public key from the trailing elements of a
+/// ciphertext, validating curve membership, subgroup order, and
+/// rejecting the identity.
+fn decode_epk(
+    elements: &[Fr254],
+    payload_len: usize,
+    compress: bool,
+) -> Result<EdwardsAffine, ZkKemDemError> {
+    let ephemeral_pub = if compress {
+        let epk_y = elements[payload_len];
+        let sign_flag = elements[payload_len + 1];
+
+        // Validate that the sign flag is 0 or 1. A malicious ciphertext
+        // could set arbitrary bits, which would corrupt the reconstructed
+        // point after the MSB shift.
+        if !sign_flag.is_zero() && !sign_flag.is_one() {
+            return Err(ZkKemDemError::InvalidEphemeralPoint(
+                "compressed sign flag must be 0 or 1",
+            ));
+        }
+
+        // Reconstruct Ark compressed point: 32-byte LE y, sign bit in MSB.
+        let mut point_bytes = epk_y.into_bigint().to_bytes_le();
+        point_bytes.resize(32, 0);
+        point_bytes[31] |= sign_flag.into_bigint().to_bytes_le()[0] << 7;
+
+        use ark_serialize::CanonicalDeserialize;
+        EdwardsAffine::deserialize_compressed(point_bytes.as_slice())
+            .map_err(|_| ZkKemDemError::InvalidEphemeralPoint("decompression failed"))?
+    } else {
+        let epk_x = elements[payload_len];
+        let epk_y = elements[payload_len + 1];
+
+        // Reject the identity element (0, 1) of the twisted-Edwards
+        // group. The identity is on-curve and in the prime-order
+        // subgroup, so the subsequent checks would not catch it.
+        if epk_x.is_zero() && epk_y.is_one() {
+            return Err(ZkKemDemError::InvalidEphemeralPoint("identity point"));
+        }
+
+        let p = EdwardsAffine::new_unchecked(epk_x, epk_y);
+        if !p.is_on_curve() {
+            return Err(ZkKemDemError::InvalidEphemeralPoint("not on BabyJubJub"));
+        }
+        p
+    };
+
+    // Reject the identity regardless of how it was decoded. The
+    // identity is in the prime-order subgroup (every subgroup contains
+    // the identity), so the subgroup check below would pass.  An
+    // attacker supplying the identity as the EPK forces every shared
+    // secret to also be the identity, making the keystream trivially
+    // recomputable.
+    if ephemeral_pub.x.is_zero() && ephemeral_pub.y.is_one() {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("identity point"));
+    }
+
+    if !ephemeral_pub.is_in_correct_subgroup_assuming_on_curve() {
+        return Err(ZkKemDemError::InvalidEphemeralPoint("wrong subgroup"));
+    }
+
+    Ok(ephemeral_pub)
+}
+
+// ─── Authenticated two-level KEM-DEM with domain separators ──────
+//
+// Wire format for the authenticated domain-separated variant:
+//
+//   compress_epk = false  →  [ct_0 … ct_{n-1}] [epk_x] [epk_y] [tag]
+//   compress_epk = true   →  [ct_0 … ct_{n-1}] [epk_y] [sign]  [tag]
+//
+// One extra Fr element (`tag`) versus the unauthenticated form. The
+// MAC key is derived from the intermediate encryption key (enc_key)
+// and both domain constants, so it is domain-separated from both the
+// keystream and from other protocols' MAC keys:
+//
+//   enc_key = Poseidon([shared.x, shared.y, kem_domain])
+//   mac_key = Poseidon([enc_key, kem_domain, dem_domain])
+//
+// The mac_key input pattern `[enc_key, kem_domain, dem_domain]` is
+// structurally distinct from any DEM keystream element `[enc_key,
+// dem_domain, counter]` (the second slot differs), so there is no
+// collision between the MAC and keystream PRF strands.
+//
+//   state = mac_key
+//   for i in 0..n:
+//     state = Poseidon([state, ct[i], Fr(i + 1)])
+//   tag = Poseidon([state, epk_component_0, epk_component_1])
+
+/// Compute the Poseidon MAC tag for the domain-separated variant.
+///
+/// `epk_elem_0`/`epk_elem_1` are the two trailing EPK elements in
+/// whichever encoding was used (compressed or uncompressed). Binding
+/// them into the tag prevents EPK substitution attacks.
+fn compute_mac_tag_with_domains(
+    enc_key: Fr254,
+    domains: &KemDemDomains,
+    epk_elem_0: Fr254,
+    epk_elem_1: Fr254,
+    ct_elements: &[Fr254],
+) -> Fr254 {
+    let mut hasher = Poseidon::<Fr254>::new_circom(3)
+        .expect("circomlib Poseidon(3) parameters are bundled in light-poseidon");
+
+    // Derive a per-session MAC key from the enc_key and both domain
+    // constants. This is structurally distinct from the keystream
+    // derivation `Poseidon([enc_key, dem_domain, i])` because the
+    // second slot is `kem_domain` (not `dem_domain`).
+    let mut state = hasher
+        .hash(&[enc_key, domains.kem_domain, domains.dem_domain])
+        .expect("Poseidon hash over 3 Fr inputs never fails");
+
+    // Absorb each ciphertext element with its position.
+    for (i, ct) in ct_elements.iter().enumerate() {
+        let counter = Fr254::from((i as u64) + 1);
+        state = hasher
+            .hash(&[state, *ct, counter])
+            .expect("Poseidon hash over 3 Fr inputs never fails");
+    }
+
+    // Bind the ephemeral public key (in whichever encoding was used).
+    hasher
+        .hash(&[state, epk_elem_0, epk_elem_1])
+        .expect("Poseidon hash over 3 Fr inputs never fails")
+}
+
+/// Authenticated counterpart of [`zk_kemdem_encrypt_with_domains`].
+/// Returns a hex ciphertext that includes a 1-element Poseidon MAC tag.
+///
+/// Wire format: `[ct_0 … ct_{n-1}] [epk_0] [epk_1] [tag]`
+/// Total: `(payload.len() + 3) * 32` bytes.
+pub fn zk_kemdem_encrypt_authenticated_with_domains(
+    random_seed: [u8; 32],
+    receiver_pub_key: &EdwardsAffine,
+    payload: &[Fr254],
+    domains: &KemDemDomains,
+    compress_epk: bool,
+) -> Result<String, ZkKemDemError> {
+    if payload.len() > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
+    let r = BabyJubJubScalar::from_le_bytes_mod_order(&random_seed);
+    if r.is_zero() {
+        return Err(ZkKemDemError::RetryNeeded);
+    }
+    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
+
+    let keystream = generate_keystream_with_domains(&shared_secret, payload.len(), domains);
+    let mut ct_elements: Vec<Fr254> = Vec::with_capacity(payload.len());
+    for i in 0..payload.len() {
+        ct_elements.push(payload[i] + keystream[i]);
+    }
+
+    // Derive the intermediate enc_key for MAC computation.
+    let mut hasher =
+        Poseidon::<Fr254>::new_circom(3).expect("circomlib Poseidon(3) parameters are bundled");
+    let enc_key = hasher
+        .hash(&[shared_secret.x, shared_secret.y, domains.kem_domain])
+        .expect("Poseidon hash over 3 Fr inputs never fails");
+
+    // Build EPK elements for the tag — must match what goes on the wire.
+    let mut epk_elems: Vec<Fr254> = Vec::with_capacity(2);
+    append_epk(&mut epk_elems, &ephemeral_pub, compress_epk);
+
+    let tag =
+        compute_mac_tag_with_domains(enc_key, domains, epk_elems[0], epk_elems[1], &ct_elements);
+
+    let mut out: Vec<Fr254> = Vec::with_capacity(payload.len() + EPHEM_AND_TAG_ELEMS);
+    out.extend_from_slice(&ct_elements);
+    out.extend_from_slice(&epk_elems);
+    out.push(tag);
+
+    Ok(encode_elements_le_hex(&out))
+}
+
+/// Authenticated counterpart of [`zk_kemdem_decrypt_with_domains`].
+/// Verifies the Poseidon MAC tag in constant time *before* decrypting;
+/// returns [`ZkKemDemError::MacMismatch`] on tampering.
+pub fn zk_kemdem_decrypt_authenticated_with_domains(
+    receiver_sec_key: &BabyJubJubScalar,
+    ciphertext_hex: &str,
+    domains: &KemDemDomains,
+    compress_epk: bool,
+) -> Result<Vec<Fr254>, ZkKemDemError> {
+    let elements = decode_elements_le_hex(ciphertext_hex)?;
+    if elements.len() < EPHEM_AND_TAG_ELEMS {
+        return Err(ZkKemDemError::InvalidEphemeralPoint(
+            "ciphertext too short: missing trailing (epk_0, epk_1, tag)",
+        ));
+    }
+    let payload_len = elements.len() - EPHEM_AND_TAG_ELEMS;
+    if payload_len > MAX_PAYLOAD_ELEMS {
+        return Err(ZkKemDemError::PayloadTooLarge {
+            len: payload_len,
+            max: MAX_PAYLOAD_ELEMS,
+        });
+    }
+
+    let ephemeral_pub = decode_epk(&elements, payload_len, compress_epk)?;
+    let received_tag = elements[payload_len + 2];
+
+    let shared_secret: EdwardsAffine = (ephemeral_pub * *receiver_sec_key).into_affine();
+
+    // Re-derive enc_key for MAC verification.
+    let mut hasher =
+        Poseidon::<Fr254>::new_circom(3).expect("circomlib Poseidon(3) parameters are bundled");
+    let enc_key = hasher
+        .hash(&[shared_secret.x, shared_secret.y, domains.kem_domain])
+        .expect("Poseidon hash over 3 Fr inputs never fails");
+
+    // Recompute the MAC over the received ciphertext and compare in
+    // constant time (see `fr_ct_eq` doc for rationale).
+    let ct_slice = &elements[..payload_len];
+    let epk_elem_0 = elements[payload_len];
+    let epk_elem_1 = elements[payload_len + 1];
+    let expected_tag =
+        compute_mac_tag_with_domains(enc_key, domains, epk_elem_0, epk_elem_1, ct_slice);
+    if !fr_ct_eq(&expected_tag, &received_tag) {
+        return Err(ZkKemDemError::MacMismatch);
+    }
+
+    // MAC verified — now decrypt.
+    let keystream = generate_keystream_with_domains(&shared_secret, payload_len, domains);
+    let mut plaintext = Vec::with_capacity(payload_len);
+    for i in 0..payload_len {
+        plaintext.push(ct_slice[i] - keystream[i]);
+    }
+    Ok(plaintext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +981,289 @@ mod tests {
             "Poseidon([shared.x=1, shared.y=2, counter=1]) drifted from the \
              pinned circomlib-compatible value; the Circom circuit will no \
              longer accept ciphertexts from this library"
+        );
+    }
+
+    // ─── Domain-separated KEM-DEM tests ──────────────────────────
+
+    fn test_domains() -> KemDemDomains {
+        KemDemDomains {
+            kem_domain: Fr254::from(0xABCD_u64),
+            dem_domain: Fr254::from(0x1234_u64),
+        }
+    }
+
+    #[test]
+    fn domain_roundtrip_uncompressed() {
+        let (sk, pk) = rand_keypair();
+        let payload: Vec<Fr254> = (0..5).map(|i| Fr254::from(i as u64 * 100 + 7)).collect();
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_with_domains(seed, &pk, &payload, &domains, false).unwrap();
+        assert_eq!(
+            ct.len(),
+            (payload.len() + EPHEM_ELEMS) * FR_BYTES * 2,
+            "wire size must be (payload + 2 ephem) * 32 bytes * 2 hex chars"
+        );
+        let pt = zk_kemdem_decrypt_with_domains(&sk, &ct, &domains, false).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_roundtrip_compressed() {
+        let (sk, pk) = rand_keypair();
+        let payload: Vec<Fr254> = (0..5).map(|i| Fr254::from(i as u64 * 100 + 7)).collect();
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_with_domains(seed, &pk, &payload, &domains, true).unwrap();
+        assert_eq!(
+            ct.len(),
+            (payload.len() + EPHEM_ELEMS) * FR_BYTES * 2,
+            "compressed EPK still uses 2 trailing elements"
+        );
+        let pt = zk_kemdem_decrypt_with_domains(&sk, &ct, &domains, true).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_wrong_key_does_not_recover() {
+        let mut rng = ark_std::test_rng();
+        let (_, pk) = rand_keypair_with(&mut rng);
+        let (other_sk, _) = rand_keypair_with(&mut rng);
+        let payload = vec![Fr254::from(0xdeadbeefu64), Fr254::from(0xfeedf00du64)];
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut rng, &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_with_domains(seed, &pk, &payload, &domains, false).unwrap();
+        let wrong = zk_kemdem_decrypt_with_domains(&other_sk, &ct, &domains, false).unwrap();
+        assert_ne!(wrong, payload);
+    }
+
+    #[test]
+    fn domain_wrong_domains_does_not_recover() {
+        let (sk, pk) = rand_keypair();
+        let payload = vec![Fr254::from(42u64)];
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_with_domains(seed, &pk, &payload, &domains, false).unwrap();
+
+        // Decrypt with different domain constants
+        let wrong_domains = KemDemDomains {
+            kem_domain: Fr254::from(0xFFFF_u64),
+            dem_domain: Fr254::from(0x5678_u64),
+        };
+        let wrong = zk_kemdem_decrypt_with_domains(&sk, &ct, &wrong_domains, false).unwrap();
+        assert_ne!(
+            wrong, payload,
+            "mismatched domains must not recover plaintext"
+        );
+    }
+
+    #[test]
+    fn domain_encrypt_zero_seed_returns_retry() {
+        use ark_ec::PrimeGroup;
+        let pk: EdwardsAffine = EdwardsProjective::generator().into_affine();
+        let payload = vec![Fr254::from(1u64)];
+        let domains = test_domains();
+        let err =
+            zk_kemdem_encrypt_with_domains([0u8; 32], &pk, &payload, &domains, false).unwrap_err();
+        assert_eq!(err, ZkKemDemError::RetryNeeded);
+    }
+
+    #[test]
+    fn domain_decrypt_rejects_oversized_payload() {
+        // Fabricate a ciphertext with (MAX_PAYLOAD_ELEMS + 1) + 2 elements.
+        let element_count = MAX_PAYLOAD_ELEMS + 1 + EPHEM_ELEMS;
+        let bytes = vec![0u8; element_count * FR_BYTES];
+        let hex = hex::encode(&bytes);
+        let sk = BabyJubJubScalar::from(42u64);
+        let domains = test_domains();
+        let err = zk_kemdem_decrypt_with_domains(&sk, &hex, &domains, false).unwrap_err();
+        match err {
+            ZkKemDemError::PayloadTooLarge { .. } => {}
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    /// Pinned test vector for the two-level keystream. If this breaks,
+    /// the domain-separated derivation formula changed — any protocol
+    /// circuit using this keystream will no longer accept ciphertexts
+    /// from this library.
+    #[test]
+    fn domain_keystream_pinned_vector() {
+        let x = Fr254::from(1u64);
+        let y = Fr254::from(2u64);
+        let p = EdwardsAffine::new_unchecked(x, y);
+        let domains = KemDemDomains {
+            kem_domain: Fr254::from(100u64),
+            dem_domain: Fr254::from(200u64),
+        };
+        let ks = generate_keystream_with_domains(&p, 1, &domains);
+        let actual = {
+            let mut bytes = ks[0].into_bigint().to_bytes_be();
+            bytes.resize(32, 0);
+            hex::encode(&bytes)
+        };
+        assert_eq!(
+            actual,
+            "2c47b543aad579cc0e63cbe2b3b249cb220bb66f34cd25c960ddba4e674f8ae4",
+            "domain keystream drifted from pinned value; any protocol circuit using \
+             this keystream will no longer accept ciphertexts from this library"
+        );
+
+        let ks2 = generate_keystream_with_domains(&p, 1, &domains);
+        assert_eq!(ks, ks2, "domain keystream must be deterministic");
+    }
+
+    #[test]
+    fn domain_keystream_differs_from_standard() {
+        let (_, pk) = rand_keypair();
+        let standard = generate_keystream(&pk, 3);
+        let domains = test_domains();
+        let domain_ks = generate_keystream_with_domains(&pk, 3, &domains);
+        assert_ne!(
+            standard, domain_ks,
+            "domain-separated keystream must differ from the standard one"
+        );
+    }
+
+    // ─── Authenticated domain-separated KEM-DEM tests ────────────
+
+    #[test]
+    fn domain_authenticated_roundtrip_uncompressed() {
+        let (sk, pk) = rand_keypair();
+        let payload: Vec<Fr254> = (0..5).map(|i| Fr254::from(i as u64 * 100 + 7)).collect();
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_authenticated_with_domains(seed, &pk, &payload, &domains, false)
+            .unwrap();
+        let pt = zk_kemdem_decrypt_authenticated_with_domains(&sk, &ct, &domains, false).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_authenticated_roundtrip_compressed() {
+        let (sk, pk) = rand_keypair();
+        let payload: Vec<Fr254> = (0..5).map(|i| Fr254::from(i as u64 * 100 + 7)).collect();
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_authenticated_with_domains(seed, &pk, &payload, &domains, true)
+            .unwrap();
+        let pt = zk_kemdem_decrypt_authenticated_with_domains(&sk, &ct, &domains, true).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_authenticated_rejects_flipped_bit() {
+        let (sk, pk) = rand_keypair();
+        let payload = vec![Fr254::from(0xdeadbeefu64), Fr254::from(0xfeedf00du64)];
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct_hex =
+            zk_kemdem_encrypt_authenticated_with_domains(seed, &pk, &payload, &domains, false)
+                .unwrap();
+        let mut bytes = hex::decode(&ct_hex).unwrap();
+        bytes[0] ^= 0x01;
+        let tampered_hex = hex::encode(&bytes);
+
+        let err = zk_kemdem_decrypt_authenticated_with_domains(&sk, &tampered_hex, &domains, false)
+            .unwrap_err();
+        assert_eq!(err, ZkKemDemError::MacMismatch);
+    }
+
+    #[test]
+    fn domain_authenticated_rejects_swapped_epk() {
+        let (sk, pk) = rand_keypair();
+        let payload = vec![Fr254::from(1u64), Fr254::from(2u64)];
+
+        let domains = test_domains();
+        let ct1 = zk_kemdem_encrypt_authenticated_with_domains(
+            [30u8; 32], &pk, &payload, &domains, false,
+        )
+        .unwrap();
+        let ct2 = zk_kemdem_encrypt_authenticated_with_domains(
+            [31u8; 32], &pk, &payload, &domains, false,
+        )
+        .unwrap();
+
+        let ct1_bytes = hex::decode(&ct1).unwrap();
+        let ct2_bytes = hex::decode(&ct2).unwrap();
+        let body_len = 2 * FR_BYTES;
+        // Splice: ct1 body + ct2 EPK + ct1 tag
+        let mut spliced = ct1_bytes[..body_len].to_vec();
+        spliced.extend_from_slice(&ct2_bytes[body_len..body_len + 2 * FR_BYTES]);
+        spliced.extend_from_slice(&ct1_bytes[body_len + 2 * FR_BYTES..]);
+        let spliced_hex = hex::encode(&spliced);
+
+        let err = zk_kemdem_decrypt_authenticated_with_domains(&sk, &spliced_hex, &domains, false)
+            .unwrap_err();
+        assert_eq!(err, ZkKemDemError::MacMismatch);
+    }
+
+    #[test]
+    fn domain_authenticated_rejects_unauthenticated_ciphertext() {
+        let (sk, pk) = rand_keypair();
+        let payload = vec![Fr254::from(42u64), Fr254::from(99u64)];
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let unauth_ct =
+            zk_kemdem_encrypt_with_domains(seed, &pk, &payload, &domains, false).unwrap();
+        let result = zk_kemdem_decrypt_authenticated_with_domains(&sk, &unauth_ct, &domains, false);
+        assert!(
+            result.is_err(),
+            "authenticated decrypt must reject an unauthenticated ciphertext"
+        );
+    }
+
+    #[test]
+    fn domain_decrypt_rejects_bad_sign_flag_compressed() {
+        let (sk, pk) = rand_keypair();
+        let payload = vec![Fr254::from(42u64)];
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct_hex =
+            zk_kemdem_encrypt_with_domains(seed, &pk, &payload, &domains, true).unwrap();
+        let mut ct_bytes = hex::decode(&ct_hex).unwrap();
+
+        let sign_flag_offset = (payload.len()) * FR_BYTES + FR_BYTES;
+        ct_bytes[sign_flag_offset] = 0x42;
+
+        let bad_hex = hex::encode(&ct_bytes);
+        let err = zk_kemdem_decrypt_with_domains(&sk, &bad_hex, &domains, true).unwrap_err();
+        assert_eq!(err, ZkKemDemError::InvalidEphemeralPoint("compressed sign flag must be 0 or 1"));
+    }
+
+    #[test]
+    fn domain_authenticated_wire_size() {
+        let (_, pk) = rand_keypair();
+        let payload = vec![Fr254::from(1u64); 4];
+        let mut seed = [0u8; 32];
+        ark_std::rand::RngCore::fill_bytes(&mut ark_std::test_rng(), &mut seed);
+
+        let domains = test_domains();
+        let ct = zk_kemdem_encrypt_authenticated_with_domains(seed, &pk, &payload, &domains, false)
+            .unwrap();
+        assert_eq!(
+            ct.len(),
+            (payload.len() + EPHEM_AND_TAG_ELEMS) * FR_BYTES * 2,
+            "authenticated wire size must be (payload + 2 epk + 1 tag) * 32 * 2"
         );
     }
 }

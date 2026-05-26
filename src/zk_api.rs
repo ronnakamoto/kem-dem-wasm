@@ -3,7 +3,9 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::hex_util::{fill_random, fr_to_be_hex, js_err, parse_babyjubjub_scalar_be, parse_fr_be};
+use crate::hex_util::{
+    fill_random, fr_to_be_hex, js_err, parse_babyjubjub_scalar_be, parse_fr_be, parse_fr_be_labeled,
+};
 
 /// ZK-friendly encryptor using a BabyJubJub KEM-DEM over the BN254
 /// scalar field `Fr`.
@@ -117,9 +119,9 @@ impl ZkEncryptor {
         let decrypted = zk_kemdem_decrypt_authenticated(&sec_key, ciphertext_hex)
             .map_err(|e| js_err(e.to_string()))?;
 
-        let arr = js_sys::Array::new();
-        for el in decrypted {
-            arr.push(&JsValue::from_str(&fr_to_be_hex(&el)));
+        let arr = js_sys::Array::new_with_length(decrypted.len() as u32);
+        for (i, el) in decrypted.iter().enumerate() {
+            arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
         }
         Ok(arr)
     }
@@ -141,9 +143,9 @@ impl ZkEncryptor {
         let decrypted =
             zk_kemdem_decrypt(&sec_key, ciphertext_hex).map_err(|e| js_err(e.to_string()))?;
 
-        let arr = js_sys::Array::new();
-        for el in decrypted {
-            arr.push(&JsValue::from_str(&fr_to_be_hex(&el)));
+        let arr = js_sys::Array::new_with_length(decrypted.len() as u32);
+        for (i, el) in decrypted.iter().enumerate() {
+            arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
         }
         Ok(arr)
     }
@@ -210,6 +212,223 @@ impl ZkEncryptor {
         js_sys::Reflect::set(&obj, &JsValue::from_str("publicKey"), &pub_obj).unwrap();
 
         Ok(obj)
+    }
+
+    /// Encrypt a payload using a two-level KEM-DEM with caller-supplied
+    /// Poseidon domain separators.
+    ///
+    /// Parameters:
+    ///   `receiver_pub_x_hex` / `receiver_pub_y_hex`
+    ///       BabyJubJub public key of the recipient (0x-prefixed BE hex Fr254).
+    ///   `payload_hex_array`
+    ///       Array of Fr254 values to encrypt (0x-prefixed BE hex strings).
+    ///   `kem_domain_hex` / `dem_domain_hex`
+    ///       Protocol-specific domain constants (0x-prefixed BE hex Fr254).
+    ///       These provide cryptographic separation between the KEM and DEM
+    ///       layers and between different protocols sharing the same key
+    ///       material.
+    ///   `compress_epk`
+    ///       `true`  → EPK stored as `[epk_y, sign_flag]` (compressed).
+    ///       `false` → EPK stored as `[epk_x, epk_y]`     (uncompressed).
+    ///
+    /// **Confidentiality only.** For integrity protection, use
+    /// [`encryptAuthenticatedWithDomains`].
+    ///
+    /// Returns a lowercase hex string of `(payload.len() + 2) * 64` characters.
+    #[wasm_bindgen(js_name = encryptWithDomains)]
+    pub fn encrypt_with_domains(
+        receiver_pub_x_hex: &str,
+        receiver_pub_y_hex: &str,
+        payload_hex_array: Vec<String>,
+        kem_domain_hex: &str,
+        dem_domain_hex: &str,
+        compress_epk: bool,
+    ) -> Result<String, JsValue> {
+        use crate::kemdem_functions::{
+            point_from_xy, zk_kemdem_encrypt_with_domains, KemDemDomains, ZkKemDemError,
+        };
+
+        let x = parse_fr_be(receiver_pub_x_hex).map_err(js_err)?;
+        let y = parse_fr_be(receiver_pub_y_hex).map_err(js_err)?;
+        let kem_domain = parse_fr_be_labeled(kem_domain_hex, "kem_domain").map_err(js_err)?;
+        let dem_domain = parse_fr_be_labeled(dem_domain_hex, "dem_domain").map_err(js_err)?;
+        let receiver_pub = point_from_xy(x, y).ok_or_else(|| {
+            js_err("receiver public key is invalid: identity, off-curve, or wrong subgroup")
+        })?;
+
+        let mut payload = Vec::with_capacity(payload_hex_array.len());
+        for s in payload_hex_array {
+            payload.push(parse_fr_be(&s).map_err(js_err)?);
+        }
+
+        let domains = KemDemDomains {
+            kem_domain,
+            dem_domain,
+        };
+
+        const MAX_RETRIES: u32 = 8;
+        for _ in 0..MAX_RETRIES {
+            let mut seed = [0u8; 32];
+            fill_random(&mut seed);
+            match zk_kemdem_encrypt_with_domains(
+                seed,
+                &receiver_pub,
+                &payload,
+                &domains,
+                compress_epk,
+            ) {
+                Ok(ct) => return Ok(ct),
+                Err(ZkKemDemError::RetryNeeded) => continue,
+                Err(other) => return Err(js_err(other.to_string())),
+            }
+        }
+        Err(js_err(
+            "CSPRNG produced zero scalar repeatedly; system entropy may be broken",
+        ))
+    }
+
+    /// Decrypt a ciphertext produced by [`encryptWithDomains`].
+    ///
+    /// Parameters mirror [`encryptWithDomains`]; `compress_epk` must match
+    /// the value used during encryption.
+    ///
+    /// Returns an array of BE hex Fr254 strings.
+    #[wasm_bindgen(js_name = decryptWithDomains)]
+    pub fn decrypt_with_domains(
+        receiver_sec_key_hex: &str,
+        ciphertext_hex: &str,
+        kem_domain_hex: &str,
+        dem_domain_hex: &str,
+        compress_epk: bool,
+    ) -> Result<js_sys::Array, JsValue> {
+        use crate::kemdem_functions::{zk_kemdem_decrypt_with_domains, KemDemDomains};
+        use ark_ff::Zero;
+
+        let sec_key = parse_babyjubjub_scalar_be(receiver_sec_key_hex).map_err(js_err)?;
+        let kem_domain = parse_fr_be_labeled(kem_domain_hex, "kem_domain").map_err(js_err)?;
+        let dem_domain = parse_fr_be_labeled(dem_domain_hex, "dem_domain").map_err(js_err)?;
+        if sec_key.is_zero() {
+            return Err(js_err("invalid secret key"));
+        }
+
+        let domains = KemDemDomains {
+            kem_domain,
+            dem_domain,
+        };
+
+        let decrypted =
+            zk_kemdem_decrypt_with_domains(&sec_key, ciphertext_hex, &domains, compress_epk)
+                .map_err(|e| js_err(e.to_string()))?;
+
+        let arr = js_sys::Array::new_with_length(decrypted.len() as u32);
+        for (i, el) in decrypted.iter().enumerate() {
+            arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
+        }
+        Ok(arr)
+    }
+
+    /// **Authenticated** counterpart of [`encryptWithDomains`]. Emits a
+    /// ciphertext that includes a Poseidon MAC tag derived from the
+    /// domain-separated intermediate encryption key.
+    ///
+    /// Returns a lowercase hex string of `(payload.len() + 3) * 64` characters
+    /// (2 extra elements for the EPK + 1 for the MAC tag).
+    #[wasm_bindgen(js_name = encryptAuthenticatedWithDomains)]
+    pub fn encrypt_authenticated_with_domains(
+        receiver_pub_x_hex: &str,
+        receiver_pub_y_hex: &str,
+        payload_hex_array: Vec<String>,
+        kem_domain_hex: &str,
+        dem_domain_hex: &str,
+        compress_epk: bool,
+    ) -> Result<String, JsValue> {
+        use crate::kemdem_functions::{
+            point_from_xy, zk_kemdem_encrypt_authenticated_with_domains, KemDemDomains,
+            ZkKemDemError,
+        };
+
+        let x = parse_fr_be(receiver_pub_x_hex).map_err(js_err)?;
+        let y = parse_fr_be(receiver_pub_y_hex).map_err(js_err)?;
+        let kem_domain = parse_fr_be_labeled(kem_domain_hex, "kem_domain").map_err(js_err)?;
+        let dem_domain = parse_fr_be_labeled(dem_domain_hex, "dem_domain").map_err(js_err)?;
+        let receiver_pub = point_from_xy(x, y).ok_or_else(|| {
+            js_err("receiver public key is invalid: identity, off-curve, or wrong subgroup")
+        })?;
+
+        let mut payload = Vec::with_capacity(payload_hex_array.len());
+        for s in payload_hex_array {
+            payload.push(parse_fr_be(&s).map_err(js_err)?);
+        }
+
+        let domains = KemDemDomains {
+            kem_domain,
+            dem_domain,
+        };
+
+        const MAX_RETRIES: u32 = 8;
+        for _ in 0..MAX_RETRIES {
+            let mut seed = [0u8; 32];
+            fill_random(&mut seed);
+            match zk_kemdem_encrypt_authenticated_with_domains(
+                seed,
+                &receiver_pub,
+                &payload,
+                &domains,
+                compress_epk,
+            ) {
+                Ok(ct) => return Ok(ct),
+                Err(ZkKemDemError::RetryNeeded) => continue,
+                Err(other) => return Err(js_err(other.to_string())),
+            }
+        }
+        Err(js_err(
+            "CSPRNG produced zero scalar repeatedly; system entropy may be broken",
+        ))
+    }
+
+    /// **Authenticated** counterpart of [`decryptWithDomains`]. Verifies
+    /// the Poseidon MAC tag before decrypting; throws if the ciphertext
+    /// was tampered with or the wrong key was used.
+    ///
+    /// `compress_epk` must match the value used during encryption.
+    #[wasm_bindgen(js_name = decryptAuthenticatedWithDomains)]
+    pub fn decrypt_authenticated_with_domains(
+        receiver_sec_key_hex: &str,
+        ciphertext_hex: &str,
+        kem_domain_hex: &str,
+        dem_domain_hex: &str,
+        compress_epk: bool,
+    ) -> Result<js_sys::Array, JsValue> {
+        use crate::kemdem_functions::{
+            zk_kemdem_decrypt_authenticated_with_domains, KemDemDomains,
+        };
+        use ark_ff::Zero;
+
+        let sec_key = parse_babyjubjub_scalar_be(receiver_sec_key_hex).map_err(js_err)?;
+        let kem_domain = parse_fr_be_labeled(kem_domain_hex, "kem_domain").map_err(js_err)?;
+        let dem_domain = parse_fr_be_labeled(dem_domain_hex, "dem_domain").map_err(js_err)?;
+        if sec_key.is_zero() {
+            return Err(js_err("invalid secret key"));
+        }
+
+        let domains = KemDemDomains {
+            kem_domain,
+            dem_domain,
+        };
+
+        let decrypted = zk_kemdem_decrypt_authenticated_with_domains(
+            &sec_key,
+            ciphertext_hex,
+            &domains,
+            compress_epk,
+        )
+        .map_err(|e| js_err(e.to_string()))?;
+
+        let arr = js_sys::Array::new_with_length(decrypted.len() as u32);
+        for (i, el) in decrypted.iter().enumerate() {
+            arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
+        }
+        Ok(arr)
     }
 }
 
@@ -414,5 +633,87 @@ mod tests {
             ZkKemDemError::InvalidEphemeralPoint("identity point") => {}
             other => panic!("expected InvalidEphemeralPoint(\"identity point\"), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn domain_roundtrip_via_core_api_uncompressed() {
+        use crate::kemdem_functions::{
+            generate_keypair_from_seed, zk_kemdem_decrypt_with_domains,
+            zk_kemdem_encrypt_with_domains, KemDemDomains,
+        };
+        use ark_bn254::Fr as Fr254;
+
+        let (sk, pk) = generate_keypair_from_seed([20u8; 32]).unwrap();
+        let payload = vec![Fr254::from(0xCAFEu64), Fr254::from(0xBEEFu64)];
+        let domains = KemDemDomains {
+            kem_domain: Fr254::from(0xABCDu64),
+            dem_domain: Fr254::from(0x1234u64),
+        };
+        let ct =
+            zk_kemdem_encrypt_with_domains([21u8; 32], &pk, &payload, &domains, false).unwrap();
+        let pt = zk_kemdem_decrypt_with_domains(&sk, &ct, &domains, false).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_roundtrip_via_core_api_compressed() {
+        use crate::kemdem_functions::{
+            generate_keypair_from_seed, zk_kemdem_decrypt_with_domains,
+            zk_kemdem_encrypt_with_domains, KemDemDomains,
+        };
+        use ark_bn254::Fr as Fr254;
+
+        let (sk, pk) = generate_keypair_from_seed([22u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..7).map(|i| Fr254::from(i as u64 * 11 + 3)).collect();
+        let domains = KemDemDomains {
+            kem_domain: Fr254::from(0x9999u64),
+            dem_domain: Fr254::from(0x8888u64),
+        };
+        let ct = zk_kemdem_encrypt_with_domains([23u8; 32], &pk, &payload, &domains, true).unwrap();
+        let pt = zk_kemdem_decrypt_with_domains(&sk, &ct, &domains, true).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_authenticated_roundtrip_via_core_api() {
+        use crate::kemdem_functions::{
+            generate_keypair_from_seed, zk_kemdem_decrypt_authenticated_with_domains,
+            zk_kemdem_encrypt_authenticated_with_domains, KemDemDomains,
+        };
+        use ark_bn254::Fr as Fr254;
+
+        let (sk, pk) = generate_keypair_from_seed([24u8; 32]).unwrap();
+        let payload = vec![Fr254::from(0xCAFEu64), Fr254::from(0xBEEFu64)];
+        let domains = KemDemDomains {
+            kem_domain: Fr254::from(0xABCDu64),
+            dem_domain: Fr254::from(0x1234u64),
+        };
+        let ct = zk_kemdem_encrypt_authenticated_with_domains(
+            [25u8; 32], &pk, &payload, &domains, false,
+        )
+        .unwrap();
+        let pt = zk_kemdem_decrypt_authenticated_with_domains(&sk, &ct, &domains, false).unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[test]
+    fn domain_authenticated_compressed_roundtrip_via_core_api() {
+        use crate::kemdem_functions::{
+            generate_keypair_from_seed, zk_kemdem_decrypt_authenticated_with_domains,
+            zk_kemdem_encrypt_authenticated_with_domains, KemDemDomains,
+        };
+        use ark_bn254::Fr as Fr254;
+
+        let (sk, pk) = generate_keypair_from_seed([26u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..4).map(|i| Fr254::from(i as u64 * 17 + 5)).collect();
+        let domains = KemDemDomains {
+            kem_domain: Fr254::from(0x7777u64),
+            dem_domain: Fr254::from(0x3333u64),
+        };
+        let ct =
+            zk_kemdem_encrypt_authenticated_with_domains([27u8; 32], &pk, &payload, &domains, true)
+                .unwrap();
+        let pt = zk_kemdem_decrypt_authenticated_with_domains(&sk, &ct, &domains, true).unwrap();
+        assert_eq!(pt, payload);
     }
 }

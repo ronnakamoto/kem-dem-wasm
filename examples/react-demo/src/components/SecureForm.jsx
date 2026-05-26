@@ -25,6 +25,24 @@ function hexToBytes(hex) {
   return bytes
 }
 
+function normalizeHex(s) {
+  if (typeof s !== 'string') s = String(s)
+  s = s.trim()
+  const hasPrefix = s.startsWith('0x') || s.startsWith('0X')
+  let clean = hasPrefix ? s.slice(2) : s
+  clean = clean.trim()
+  if (clean.length === 0) clean = '00'
+  if (!/^[0-9a-fA-F]+$/.test(clean)) {
+    throw new Error('Invalid hex string')
+  }
+  if (clean.length % 2 !== 0) clean = '0' + clean
+  if (clean.length > 64) {
+    throw new Error('Hex must be ≤ 32 bytes')
+  }
+  clean = clean.toLowerCase().padStart(64, '0')
+  return '0x' + clean
+}
+
 export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
   const [keys, setKeys] = useState(null)
   const [keyGenMode, setKeyGenMode] = useState('random') // 'random' | 'ikm' | 'signature'
@@ -87,6 +105,11 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
     try { return window.__zkKeypair || null } catch { return null }
   })
   const [algorithm, setAlgorithm] = useState('hpke')
+  const [zkAuth, setZkAuth] = useState(true)
+  const [zkUseDomains, setZkUseDomains] = useState(false)
+  const [zkKemDomain, setZkKemDomain] = useState('0x0000000000000000000000000000000000000000000000000000000000001111')
+  const [zkDemDomain, setZkDemDomain] = useState('0x0000000000000000000000000000000000000000000000000000000000002222')
+  const [zkCompressEpk, setZkCompressEpk] = useState(false)
 
   const handleGenerateKeys = useCallback(() => {
     try {
@@ -228,23 +251,7 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
   const handleEncrypt = useCallback(() => {
     if (algorithm === 'zk') {
       try {
-        const normalizeHex = (s) => {
-          if (typeof s !== 'string') s = String(s)
-          s = s.trim()
-          const hasPrefix = s.startsWith('0x') || s.startsWith('0X')
-          let clean = hasPrefix ? s.slice(2) : s
-          clean = clean.trim()
-          if (clean.length === 0) clean = '00'
-          if (!/^[0-9a-fA-F]+$/.test(clean)) {
-            throw new Error('Invalid hex string')
-          }
-          if (clean.length % 2 !== 0) clean = '0' + clean
-          if (clean.length > 64) {
-            throw new Error('ZK payload hex must be ≤ 32 bytes')
-          }
-          clean = clean.toLowerCase().padStart(64, '0')
-          return '0x' + clean
-        }
+
 
         const encodeUtf8ToFrHex = (value) => {
           const bytes = new TextEncoder().encode(value)
@@ -275,7 +282,37 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
         // tag in constant time before returning plaintext. Recommended
         // for any data not consumed inside a SNARK that itself enforces
         // integrity.
-        const ciphertext = zkEncryptor.encryptAuthenticated(xHex, yHex, payloadHex)
+        // Check ZK encryption mode
+        let ciphertext;
+        if (zkUseDomains) {
+          const kem = normalizeHex(zkKemDomain);
+          const dem = normalizeHex(zkDemDomain);
+          if (zkAuth) {
+            ciphertext = zkEncryptor.encryptAuthenticatedWithDomains(
+              xHex,
+              yHex,
+              payloadHex,
+              kem,
+              dem,
+              zkCompressEpk
+            );
+          } else {
+            ciphertext = zkEncryptor.encryptWithDomains(
+              xHex,
+              yHex,
+              payloadHex,
+              kem,
+              dem,
+              zkCompressEpk
+            );
+          }
+        } else {
+          if (zkAuth) {
+            ciphertext = zkEncryptor.encryptAuthenticated(xHex, yHex, payloadHex);
+          } else {
+            ciphertext = zkEncryptor.encrypt(xHex, yHex, payloadHex);
+          }
+        }
         setZkCiphertext(ciphertext)
         setActiveTab('zk')
         setError(null)
@@ -318,7 +355,19 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
     } catch (err) {
       setError('Encryption failed: ' + err.message)
     }
-  }, [kemDem, zkEncryptor, keys, fields, algorithm])
+  }, [
+    kemDem,
+    zkEncryptor,
+    keys,
+    fields,
+    algorithm,
+    zkAuth,
+    zkUseDomains,
+    zkKemDomain,
+    zkDemDomain,
+    zkCompressEpk,
+    zkKeypair,
+  ])
 
   const handleDecrypt = useCallback(() => {
     if (algorithm === 'zk') {
@@ -332,11 +381,35 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
           setError('ZK keypair not available')
           return
         }
-        // Authenticated path: verifies the Poseidon MAC tag (constant
-        // time) before returning plaintext. Throws on tampering or
-        // wrong-key. Must match `encryptAuthenticated` used in
-        // `handleEncrypt`.
-        const decryptedFrArray = zkEncryptor.decryptAuthenticated(secKey, zkCiphertext)
+        // Decrypt based on configuration
+        let decryptedFrArray;
+        if (zkUseDomains) {
+          const kem = normalizeHex(zkKemDomain);
+          const dem = normalizeHex(zkDemDomain);
+          if (zkAuth) {
+            decryptedFrArray = zkEncryptor.decryptAuthenticatedWithDomains(
+              secKey,
+              zkCiphertext,
+              kem,
+              dem,
+              zkCompressEpk
+            );
+          } else {
+            decryptedFrArray = zkEncryptor.decryptWithDomains(
+              secKey,
+              zkCiphertext,
+              kem,
+              dem,
+              zkCompressEpk
+            );
+          }
+        } else {
+          if (zkAuth) {
+            decryptedFrArray = zkEncryptor.decryptAuthenticated(secKey, zkCiphertext);
+          } else {
+            decryptedFrArray = zkEncryptor.decrypt(secKey, zkCiphertext);
+          }
+        }
         const decoded = []
         for (let i = 0; i < decryptedFrArray.length; i++) {
           const hexStr = decryptedFrArray[i]
@@ -365,7 +438,20 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
     } catch (err) {
       setError('Decryption failed: ' + (err.message || err))
     }
-  }, [kemDem, zkEncryptor, keys, encryptedPackage, algorithm, zkCiphertext, zkKeypair])
+  }, [
+    kemDem,
+    zkEncryptor,
+    keys,
+    encryptedPackage,
+    algorithm,
+    zkCiphertext,
+    zkKeypair,
+    zkAuth,
+    zkUseDomains,
+    zkKemDomain,
+    zkDemDomain,
+    zkCompressEpk,
+  ])
 
   const handleLoadFromJson = useCallback(() => {
     try {
@@ -640,6 +726,67 @@ export default function SecureForm({ kemDem, zkEncryptor, EncryptedPackage }) {
                 Pub Y: {zkKeypair.publicKey?.y}
               </code>
             </div>
+          </div>
+        )}
+
+        {algorithm === 'zk' && (
+          <div className="zk-options-container" style={{ margin: '1rem 0', padding: '1rem', border: '1px solid var(--border)', borderRadius: '8px', background: 'rgba(255,255,255,0.02)' }}>
+            <h3 style={{ fontSize: '0.9rem', marginBottom: '0.75rem', color: 'var(--text-bright)' }}>ZK Encryption Settings</h3>
+            
+            <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.85rem' }}>
+                <input
+                  type="checkbox"
+                  checked={zkAuth}
+                  onChange={(e) => setZkAuth(e.target.checked)}
+                />
+                Authenticated (Poseidon MAC)
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.85rem' }}>
+                <input
+                  type="checkbox"
+                  checked={zkUseDomains}
+                  onChange={(e) => setZkUseDomains(e.target.checked)}
+                />
+                Enable Custom Domain Separation
+              </label>
+            </div>
+
+            {zkUseDomains && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', borderLeft: '2px solid var(--primary)', paddingLeft: '1rem', marginTop: '0.5rem' }}>
+                <div className="input-group" style={{ marginBottom: 0 }}>
+                  <label style={{ fontSize: '0.75rem' }}>KEM Domain Separator (BE hex Fr254)</label>
+                  <input
+                    type="text"
+                    value={zkKemDomain}
+                    onChange={(e) => setZkKemDomain(e.target.value)}
+                    placeholder="e.g. 0x0000000000000000000000000000000000000000000000000000000000001111"
+                    style={{ fontSize: '0.8rem', padding: '0.375rem 0.5rem' }}
+                  />
+                </div>
+
+                <div className="input-group" style={{ marginBottom: 0 }}>
+                  <label style={{ fontSize: '0.75rem' }}>DEM Domain Separator (BE hex Fr254)</label>
+                  <input
+                    type="text"
+                    value={zkDemDomain}
+                    onChange={(e) => setZkDemDomain(e.target.value)}
+                    placeholder="e.g. 0x0000000000000000000000000000000000000000000000000000000000002222"
+                    style={{ fontSize: '0.8rem', padding: '0.375rem 0.5rem' }}
+                  />
+                </div>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', marginTop: '0.25rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={zkCompressEpk}
+                    onChange={(e) => setZkCompressEpk(e.target.checked)}
+                  />
+                  Compress Ephemeral Public Key (EPK) on wire
+                </label>
+              </div>
+            )}
           </div>
         )}
 

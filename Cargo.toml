@@ -46,6 +46,7 @@ subtle = { version = "2.6", default-features = false }
 ark-bn254 = { version = "0.5", default-features = false }
 ark-ff = { version = "0.5", default-features = false }
 ark-ec = { version = "0.5", default-features = false }
+ark-serialize = { version = "0.5", default-features = false }
 ark-std = { version = "0.5", default-features = false }
 light-poseidon = "0.4"
 # iden3 / circomlib-compatible BabyJubJub (a = 168700, d = 168696,
