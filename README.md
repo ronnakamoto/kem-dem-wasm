@@ -381,6 +381,53 @@ const pt = ZkEncryptor.decrypt(kp.secretKey, ct)
 // pt → ["0x...", "0x..."]
 ```
 
+### Domain-Separated Encryption
+
+For protocols that share the same BabyJubJub key material but require cryptographic isolation, the library supports **caller-supplied domain constants**. Domain constants provide separation between the KEM and DEM layers and — crucially — between different protocols:
+
+```javascript
+// Domain constants are 0x-prefixed 64-char hex Fr254 values.
+// Convention: SHA256 hash of a descriptive protocol string, reduced mod the field.
+const kemDomain = '0x...'  // e.g. Fr(SHA256("MyProtocol|PurposeKEM"))
+const demDomain = '0x...'  // e.g. Fr(SHA256("MyProtocol|PurposeDEM"))
+
+// ── Unauthenticated domain-separated encrypt/decrypt
+const ct = ZkEncryptor.encryptWithDomains(
+  kp.publicKey.x, kp.publicKey.y, payload,
+  kemDomain, demDomain,
+  false,  // compress_epk: false = uncompressed [epk_x, epk_y]
+)
+const pt = ZkEncryptor.decryptWithDomains(
+  kp.secretKey, ct, kemDomain, demDomain, false,
+)
+
+// ── Authenticated domain-separated (recommended)
+const ctAuth = ZkEncryptor.encryptAuthenticatedWithDomains(
+  kp.publicKey.x, kp.publicKey.y, payload,
+  kemDomain, demDomain,
+  false,  // compress_epk
+)
+const ptAuth = ZkEncryptor.decryptAuthenticatedWithDomains(
+  kp.secretKey, ctAuth, kemDomain, demDomain, false,
+)
+```
+
+#### Compressed EPK Encoding
+
+Set `compress_epk = true` to store the ephemeral public key in compressed form (`[epk_y, sign_flag]` instead of `[epk_x, epk_y]`). The ciphertext length is unchanged (still 2 trailing elements) but the encoding saves bandwidth in circuits that only need the y-coordinate:
+
+```javascript
+const ct = ZkEncryptor.encryptWithDomains(
+  kp.publicKey.x, kp.publicKey.y, payload,
+  kemDomain, demDomain,
+  true,  // compressed
+)
+// Decompress must also use compress_epk = true
+const pt = ZkEncryptor.decryptWithDomains(
+  kp.secretKey, ct, kemDomain, demDomain, true,
+)
+```
+
 ### Use Cases
 
 - **Private voting**: Encrypt votes as Fr elements, prove correctness in a SNARK without revealing plaintext
@@ -390,9 +437,10 @@ const pt = ZkEncryptor.decrypt(kp.secretKey, ct)
 ### Security Notes
 
 - **Prefer `encryptAuthenticated`/`decryptAuthenticated`** for any data that is not consumed inside a SNARK that itself enforces integrity. The authenticated variant appends a Poseidon MAC tag bound to the shared secret and the ephemeral public key, and the decrypt path verifies the tag in constant time before returning plaintext.
+- **Domain separation** prevents cross-protocol attacks when multiple protocols share the same BabyJubJub key material. Use `encryptAuthenticatedWithDomains` with unique constants derived from `SHA256("ProtocolName|Purpose")` to isolate protocols cryptographically.
 - The KEM uses a fresh random ephemeral scalar `r` per encryption. Reusing `r` leaks the payload.
 - The unauthenticated `encrypt`/`decrypt` DEM is a Poseidon-derived stream cipher (addition in the field). It provides confidentiality but **no authentication**, so a bit-flip in the ciphertext flips the corresponding plaintext bit silently. Only use it when an enclosing SNARK or other channel guarantees integrity; otherwise use the authenticated variant or the HPKE API.
-- The ciphertext stores the ephemeral public key uncompressed `(x, y)` to avoid expensive point decompression inside circuits.
+- The ciphertext stores the ephemeral public key uncompressed `(x, y)` by default. Use `compress_epk = true` with the domain-separated API to store a compressed encoding `[epk_y, sign_flag]` when bandwidth is a concern.
 
 ## License
 
