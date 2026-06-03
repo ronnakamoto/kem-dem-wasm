@@ -381,6 +381,46 @@ const pt = ZkEncryptor.decrypt(kp.secretKey, ct)
 // pt → ["0x...", "0x..."]
 ```
 
+### Custom Curve Support (Curve-Agnostic Mode)
+
+By default, the library uses the built-in BabyJubJub curve. However, you can use the curve-agnostic API (`*On` methods) to perform encryption on any custom Twisted Edwards curve over the BN254 scalar field:
+
+```javascript
+import { ZkCurve, ZkEncryptor } from 'kem-dem-wasm'
+
+// Define a custom curve (a, d, generator X, generator Y, scalar order, cofactor)
+// Parameters must be valid: complete curve, on-curve generator, prime-order subgroup.
+// The built-in default parameters are shown here as an example:
+const myCurve = new ZkCurve(
+  "0x00000000000000000000000000000000000000000000000000000000000292fc", // a
+  "0x00000000000000000000000000000000000000000000000000000000000292f8", // d
+  "0x248f21900a0b22a01d1fa4e0c4014d7a86071060938b8c2c1c68f638148b59d7", // gx
+  "0x2df7db445a6c4b2b3504104597b83f3d790d96d741c8888b1d1cd780ebbd2f17", // gy
+  "2736030358979909402780800718157159386076813972158567259200215660948447373041", // scalar_order
+  8n // cofactor
+)
+
+// Generate a keypair on the custom curve
+const kp = ZkEncryptor.generateKeypairOn(myCurve)
+
+// Verify derived public key from a secret key on the custom curve
+const pk = ZkEncryptor.publicKeyFromSecretOn(myCurve, kp.secretKey)
+
+// Encrypt payload
+const ct = ZkEncryptor.encryptAuthenticatedOn(
+  myCurve, kp.publicKey.x, kp.publicKey.y, payload
+)
+
+// Decrypt payload
+const pt = ZkEncryptor.decryptAuthenticatedOn(myCurve, kp.secretKey, ct)
+
+// Unauthenticated variants are also available:
+// ZkEncryptor.encryptOn(myCurve, ...)
+// ZkEncryptor.decryptOn(myCurve, ...)
+```
+
+The arithmetic for custom curves runs through a constant-time runtime backend, maintaining the exact same Poseidon-based KEM-DEM construction but using your specified curve parameters.
+
 ### Domain-Separated Encryption
 
 For protocols that share the same BabyJubJub key material but require cryptographic isolation, the library supports **caller-supplied domain constants**. Domain constants provide separation between the KEM and DEM layers and — crucially — between different protocols:
