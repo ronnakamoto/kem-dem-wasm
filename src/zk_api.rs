@@ -7,6 +7,43 @@ use crate::hex_util::{
     fill_random, fr_to_be_hex, js_err, parse_babyjubjub_scalar_be, parse_fr_be, parse_fr_be_labeled,
 };
 
+/// Parse a 0x-prefixed big-endian hex secret key into the 32-byte
+/// little-endian buffer the curve-generic dispatcher expects.
+///
+/// The string must decode to exactly 32 bytes; any other length is a
+/// hard error. The returned bytes are a verbatim BE→LE reverse of
+/// the input, so for callers using the default curve this is the
+/// canonical encoding of the secret scalar mod the BabyJubJub
+/// scalar field. For custom curves, the runtime backend treats the
+/// bytes as a 256-bit unsigned integer (see `runtime_kemdem`'s
+/// docs).
+///
+/// All-zero buffers are rejected up-front so the JS facade emits a
+/// uniform `"invalid secret key"` message for the obvious mistake of
+/// passing an empty / placeholder key; non-trivial near-zero values
+/// that happen to reduce to zero on a given curve are caught later
+/// by the dispatcher's `RetryNeeded` arm.
+fn parse_secret_key_to_le32(hex_be: &str) -> Result<[u8; 32], JsValue> {
+    let stripped = hex_be.trim_start_matches("0x");
+    let bytes = hex::decode(stripped)
+        .map_err(|e| js_err(format!("invalid secret key hex: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(js_err(format!(
+            "invalid secret key length: expected 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    if bytes.iter().all(|&b| b == 0) {
+        return Err(js_err("invalid secret key"));
+    }
+    let mut le = [0u8; 32];
+    // Input is big-endian; reverse to little-endian.
+    for (i, b) in bytes.iter().enumerate() {
+        le[31 - i] = *b;
+    }
+    Ok(le)
+}
+
 /// ZK-friendly encryptor using a BabyJubJub KEM-DEM over the BN254
 /// scalar field `Fr`.
 ///
@@ -429,6 +466,217 @@ impl ZkEncryptor {
             arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
         }
         Ok(arr)
+    }
+}
+
+// ── Curve-generic dispatcher methods ─────────────────────────────
+//
+// Each `*On(curve, ...)` method takes an explicit `&ZkCurve` and
+// routes to `crate::kemdem_functions::*_on`. The legacy methods
+// above stay unchanged: they implicitly use the built-in default
+// curve, so previously-deployed callers see byte-identical output.
+//
+// The default curve continues to use the audited typed
+// `taceo-ark-babyjubjub` arithmetic; any other curve constructed via
+// `ZkCurve.newValidated(...)` is routed through the curve-generic
+// runtime arithmetic backend in `crate::te_arith`. Cross-backend
+// byte-equivalence on the default curve is asserted by the
+// `cross_backend_*` goldens in `crate::kemdem_functions::tests`.
+
+#[wasm_bindgen]
+impl ZkEncryptor {
+    /// Generate a BabyJubJub keypair on the supplied curve, seeded by
+    /// the OS CSPRNG. Returns `{ secretKey, publicKey: { x, y } }`.
+    #[wasm_bindgen(js_name = generateKeypairOn)]
+    pub fn generate_keypair_on(curve: &crate::curve::ZkCurve) -> Result<js_sys::Object, JsValue> {
+        use crate::kemdem_functions::{generate_keypair_from_seed_on, ZkKemDemError};
+
+        const MAX_RETRIES: u32 = 8;
+        let mut tuple = None;
+        for _ in 0..MAX_RETRIES {
+            let mut seed = [0u8; 32];
+            fill_random(&mut seed);
+            match generate_keypair_from_seed_on(curve.curve(), seed) {
+                Ok(t) => {
+                    tuple = Some(t);
+                    break;
+                }
+                Err(ZkKemDemError::RetryNeeded) => continue,
+                Err(other) => return Err(js_err(other.to_string())),
+            }
+        }
+        let (sk_le, pk_x, pk_y) = tuple.ok_or_else(|| {
+            js_err("CSPRNG produced zero scalar repeatedly; system entropy may be broken")
+        })?;
+
+        // The dispatcher returns the secret in canonical little-endian
+        // form (32 bytes). Surface it on the JS side as 0x-prefixed
+        // big-endian hex, matching the `secretKey` formatting used
+        // everywhere else in the API.
+        let mut sk_be = sk_le;
+        sk_be.reverse();
+
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("secretKey"),
+            &JsValue::from_str(&format!("0x{}", hex::encode(sk_be))),
+        )
+        .unwrap();
+        let pub_obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &pub_obj,
+            &JsValue::from_str("x"),
+            &JsValue::from_str(&fr_to_be_hex(&pk_x)),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &pub_obj,
+            &JsValue::from_str("y"),
+            &JsValue::from_str(&fr_to_be_hex(&pk_y)),
+        )
+        .unwrap();
+        js_sys::Reflect::set(&obj, &JsValue::from_str("publicKey"), &pub_obj).unwrap();
+        Ok(obj)
+    }
+
+    /// Curve-generic counterpart of [`encrypt`].
+    #[wasm_bindgen(js_name = encryptOn)]
+    pub fn encrypt_on(
+        curve: &crate::curve::ZkCurve,
+        receiver_pub_x_hex: &str,
+        receiver_pub_y_hex: &str,
+        payload_hex_array: Vec<String>,
+    ) -> Result<String, JsValue> {
+        use crate::kemdem_functions::{zk_kemdem_encrypt_on, ZkKemDemError};
+
+        let x = parse_fr_be(receiver_pub_x_hex).map_err(js_err)?;
+        let y = parse_fr_be(receiver_pub_y_hex).map_err(js_err)?;
+        let mut payload = Vec::with_capacity(payload_hex_array.len());
+        for s in payload_hex_array {
+            payload.push(parse_fr_be(&s).map_err(js_err)?);
+        }
+
+        const MAX_RETRIES: u32 = 8;
+        for _ in 0..MAX_RETRIES {
+            let mut seed = [0u8; 32];
+            fill_random(&mut seed);
+            match zk_kemdem_encrypt_on(curve.curve(), seed, x, y, &payload) {
+                Ok(ct) => return Ok(ct),
+                Err(ZkKemDemError::RetryNeeded) => continue,
+                Err(other) => return Err(js_err(other.to_string())),
+            }
+        }
+        Err(js_err(
+            "CSPRNG produced zero scalar repeatedly; system entropy may be broken",
+        ))
+    }
+
+    /// Curve-generic counterpart of [`encryptAuthenticated`].
+    #[wasm_bindgen(js_name = encryptAuthenticatedOn)]
+    pub fn encrypt_authenticated_on(
+        curve: &crate::curve::ZkCurve,
+        receiver_pub_x_hex: &str,
+        receiver_pub_y_hex: &str,
+        payload_hex_array: Vec<String>,
+    ) -> Result<String, JsValue> {
+        use crate::kemdem_functions::{zk_kemdem_encrypt_authenticated_on, ZkKemDemError};
+
+        let x = parse_fr_be(receiver_pub_x_hex).map_err(js_err)?;
+        let y = parse_fr_be(receiver_pub_y_hex).map_err(js_err)?;
+        let mut payload = Vec::with_capacity(payload_hex_array.len());
+        for s in payload_hex_array {
+            payload.push(parse_fr_be(&s).map_err(js_err)?);
+        }
+
+        const MAX_RETRIES: u32 = 8;
+        for _ in 0..MAX_RETRIES {
+            let mut seed = [0u8; 32];
+            fill_random(&mut seed);
+            match zk_kemdem_encrypt_authenticated_on(curve.curve(), seed, x, y, &payload) {
+                Ok(ct) => return Ok(ct),
+                Err(ZkKemDemError::RetryNeeded) => continue,
+                Err(other) => return Err(js_err(other.to_string())),
+            }
+        }
+        Err(js_err(
+            "CSPRNG produced zero scalar repeatedly; system entropy may be broken",
+        ))
+    }
+
+    /// Curve-generic counterpart of [`decrypt`].
+    #[wasm_bindgen(js_name = decryptOn)]
+    pub fn decrypt_on(
+        curve: &crate::curve::ZkCurve,
+        receiver_sec_key_hex: &str,
+        ciphertext_hex: &str,
+    ) -> Result<js_sys::Array, JsValue> {
+        use crate::kemdem_functions::zk_kemdem_decrypt_on;
+
+        let sec_key_le = parse_secret_key_to_le32(receiver_sec_key_hex)?;
+        let decrypted = zk_kemdem_decrypt_on(curve.curve(), &sec_key_le, ciphertext_hex)
+            .map_err(|e| js_err(e.to_string()))?;
+        let arr = js_sys::Array::new_with_length(decrypted.len() as u32);
+        for (i, el) in decrypted.iter().enumerate() {
+            arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
+        }
+        Ok(arr)
+    }
+
+    /// Curve-generic counterpart of [`decryptAuthenticated`].
+    #[wasm_bindgen(js_name = decryptAuthenticatedOn)]
+    pub fn decrypt_authenticated_on(
+        curve: &crate::curve::ZkCurve,
+        receiver_sec_key_hex: &str,
+        ciphertext_hex: &str,
+    ) -> Result<js_sys::Array, JsValue> {
+        use crate::kemdem_functions::zk_kemdem_decrypt_authenticated_on;
+
+        let sec_key_le = parse_secret_key_to_le32(receiver_sec_key_hex)?;
+        let decrypted =
+            zk_kemdem_decrypt_authenticated_on(curve.curve(), &sec_key_le, ciphertext_hex)
+                .map_err(|e| js_err(e.to_string()))?;
+        let arr = js_sys::Array::new_with_length(decrypted.len() as u32);
+        for (i, el) in decrypted.iter().enumerate() {
+            arr.set(i as u32, JsValue::from_str(&fr_to_be_hex(el)));
+        }
+        Ok(arr)
+    }
+
+    /// Derive a public key from a secret key on the supplied curve.
+    /// Returns `{ x, y }` (0x-prefixed BE hex). Useful for verifying
+    /// that a JS-derived scalar lands on the expected curve point
+    /// without having to re-implement scalar-mul in JS.
+    #[wasm_bindgen(js_name = publicKeyFromSecretOn)]
+    pub fn public_key_from_secret_on(
+        curve: &crate::curve::ZkCurve,
+        secret_key_hex: &str,
+    ) -> Result<js_sys::Object, JsValue> {
+        use crate::kemdem_functions::generate_keypair_from_seed_on;
+
+        // The 32-byte LE secret-key bytes serve directly as the
+        // "seed" the dispatcher consumes. For the default curve the
+        // dispatcher reduces them mod the BabyJubJub scalar field,
+        // which is a no-op on a canonical sk encoding; for custom
+        // curves the runtime backend treats them as a 256-bit scalar.
+        let seed = parse_secret_key_to_le32(secret_key_hex)?;
+
+        let (_re_sk, x, y) = generate_keypair_from_seed_on(curve.curve(), seed)
+            .map_err(|e| js_err(e.to_string()))?;
+        let pub_obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &pub_obj,
+            &JsValue::from_str("x"),
+            &JsValue::from_str(&fr_to_be_hex(&x)),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &pub_obj,
+            &JsValue::from_str("y"),
+            &JsValue::from_str(&fr_to_be_hex(&y)),
+        )
+        .unwrap();
+        Ok(pub_obj)
     }
 }
 

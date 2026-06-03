@@ -32,13 +32,33 @@
 //! match `circomlib`'s `Poseidon(3)` template byte-for-byte.
 
 use ark_bn254::Fr as Fr254;
-use ark_ec::{CurveGroup, PrimeGroup};
+use ark_ec::CurveGroup;
 use ark_ff::{BigInteger, One, PrimeField, Zero};
 use light_poseidon::{Poseidon, PoseidonHasher};
 use std::fmt;
 use std::ops::Add;
+use std::str::FromStr;
 use subtle::ConstantTimeEq;
-use taceo_ark_babyjubjub::{EdwardsAffine, EdwardsProjective, Fr as BabyJubJubScalar};
+use taceo_ark_babyjubjub::{EdwardsAffine, Fr as BabyJubJubScalar};
+
+/// Generator point for the built-in default curve (the parameters
+/// this crate has used since `0.1.0`). Internal-only helper; the
+/// curve-generic public API exposes the same point via
+/// [`crate::curve::Curve::default_v1`].
+fn default_v1_generator() -> EdwardsAffine {
+    let x = Fr254::from_str(
+        "16540640123574156134436876038791482806971768689494387082833631921987005038935",
+    )
+    .expect("default_v1 generator x must be a valid BN254 field element");
+    let y = Fr254::from_str(
+        "20819045374670962167435360035096875258406992893633759881276124905556507972311",
+    )
+    .expect("default_v1 generator y must be a valid BN254 field element");
+    let generator = EdwardsAffine::new_unchecked(x, y);
+    debug_assert!(generator.is_on_curve());
+    debug_assert!(generator.is_in_correct_subgroup_assuming_on_curve());
+    generator
+}
 
 /// Structured errors from the ZK KEM-DEM. Distinguishing `RetryNeeded`
 /// from real failures lets the caller's retry loop key off a variant
@@ -123,7 +143,7 @@ pub fn zk_kemdem_encrypt(
     if r.is_zero() {
         return Err(ZkKemDemError::RetryNeeded);
     }
-    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let ephemeral_pub: EdwardsAffine = (default_v1_generator() * r).into_affine();
     let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
 
     let keystream = generate_keystream(&shared_secret, payload.len());
@@ -267,7 +287,7 @@ pub fn generate_keypair_from_seed(
     if sk.is_zero() {
         return Err(ZkKemDemError::RetryNeeded);
     }
-    let pk = (EdwardsProjective::generator() * sk).into_affine();
+    let pk = (default_v1_generator() * sk).into_affine();
     Ok((sk, pk))
 }
 
@@ -375,7 +395,7 @@ pub fn zk_kemdem_encrypt_authenticated(
     if r.is_zero() {
         return Err(ZkKemDemError::RetryNeeded);
     }
-    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let ephemeral_pub: EdwardsAffine = (default_v1_generator() * r).into_affine();
     let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
 
     let keystream = generate_keystream(&shared_secret, payload.len());
@@ -553,7 +573,7 @@ pub fn zk_kemdem_encrypt_with_domains(
     if r.is_zero() {
         return Err(ZkKemDemError::RetryNeeded);
     }
-    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let ephemeral_pub: EdwardsAffine = (default_v1_generator() * r).into_affine();
     let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
 
     let keystream = generate_keystream_with_domains(&shared_secret, payload.len(), domains);
@@ -777,7 +797,7 @@ pub fn zk_kemdem_encrypt_authenticated_with_domains(
     if r.is_zero() {
         return Err(ZkKemDemError::RetryNeeded);
     }
-    let ephemeral_pub: EdwardsAffine = (EdwardsProjective::generator() * r).into_affine();
+    let ephemeral_pub: EdwardsAffine = (default_v1_generator() * r).into_affine();
     let shared_secret: EdwardsAffine = (*receiver_pub_key * r).into_affine();
 
     let keystream = generate_keystream_with_domains(&shared_secret, payload.len(), domains);
@@ -863,6 +883,144 @@ pub fn zk_kemdem_decrypt_authenticated_with_domains(
     Ok(plaintext)
 }
 
+// ─── Curve-generic dispatchers ───────────────────────────────────
+//
+// These wrappers carry an explicit [`Curve`] argument and route to
+// the appropriate arithmetic backend:
+//
+// - `curve == Curve::default_v1()` → typed `taceo-ark-babyjubjub`
+//   pipeline above (audited, byte-stable, what every legacy caller
+//   already uses).
+// - any other validated curve → curve-generic runtime pipeline in
+//   [`crate::runtime_kemdem`], which drives the same Poseidon stages
+//   over the runtime twisted-Edwards backend in [`crate::te_arith`].
+//
+// Cross-backend equivalence on the default curve (i.e. routing
+// through the runtime path produces byte-identical ciphertext to the
+// typed path) is asserted by the `cross_backend_*` goldens in this
+// module's `tests` block.
+//
+// All scalars travel as raw little-endian 32-byte buffers so the
+// signature does not bake in `taceo-ark-babyjubjub`'s `Fr` type. For
+// the default curve, the typed branch reduces those bytes via
+// `Fr::from_le_bytes_mod_order`, giving exactly the same scalar that
+// the legacy entry points produce. For custom curves, the runtime
+// ladder in [`crate::te_arith::scalar_mul`] consumes the bytes
+// directly as a 256-bit unsigned integer (see `runtime_kemdem` docs
+// for why this is sound).
+
+use crate::curve::Curve;
+
+/// Encrypt with explicit curve parameters. See [`zk_kemdem_encrypt`].
+pub fn zk_kemdem_encrypt_on(
+    curve: &Curve,
+    random_seed: [u8; 32],
+    receiver_pub_x: Fr254,
+    receiver_pub_y: Fr254,
+    payload: &[Fr254],
+) -> Result<String, ZkKemDemError> {
+    if curve == &Curve::default_v1() {
+        let pk = point_from_xy(receiver_pub_x, receiver_pub_y).ok_or(
+            ZkKemDemError::InvalidEphemeralPoint(
+                "receiver public key is invalid: identity, off-curve, or wrong subgroup",
+            ),
+        )?;
+        zk_kemdem_encrypt(random_seed, &pk, payload)
+    } else {
+        crate::runtime_kemdem::encrypt(
+            curve,
+            &random_seed,
+            receiver_pub_x,
+            receiver_pub_y,
+            payload,
+        )
+    }
+}
+
+/// Decrypt with explicit curve parameters. See [`zk_kemdem_decrypt`].
+pub fn zk_kemdem_decrypt_on(
+    curve: &Curve,
+    receiver_sec_key: &[u8; 32],
+    ciphertext_hex: &str,
+) -> Result<Vec<Fr254>, ZkKemDemError> {
+    if curve == &Curve::default_v1() {
+        let sk = BabyJubJubScalar::from_le_bytes_mod_order(receiver_sec_key);
+        if sk.is_zero() {
+            return Err(ZkKemDemError::RetryNeeded);
+        }
+        zk_kemdem_decrypt(&sk, ciphertext_hex)
+    } else {
+        crate::runtime_kemdem::decrypt(curve, receiver_sec_key, ciphertext_hex)
+    }
+}
+
+/// Authenticated encrypt with explicit curve parameters. See
+/// [`zk_kemdem_encrypt_authenticated`].
+pub fn zk_kemdem_encrypt_authenticated_on(
+    curve: &Curve,
+    random_seed: [u8; 32],
+    receiver_pub_x: Fr254,
+    receiver_pub_y: Fr254,
+    payload: &[Fr254],
+) -> Result<String, ZkKemDemError> {
+    if curve == &Curve::default_v1() {
+        let pk = point_from_xy(receiver_pub_x, receiver_pub_y).ok_or(
+            ZkKemDemError::InvalidEphemeralPoint(
+                "receiver public key is invalid: identity, off-curve, or wrong subgroup",
+            ),
+        )?;
+        zk_kemdem_encrypt_authenticated(random_seed, &pk, payload)
+    } else {
+        crate::runtime_kemdem::encrypt_authenticated(
+            curve,
+            &random_seed,
+            receiver_pub_x,
+            receiver_pub_y,
+            payload,
+        )
+    }
+}
+
+/// Authenticated decrypt with explicit curve parameters. See
+/// [`zk_kemdem_decrypt_authenticated`].
+pub fn zk_kemdem_decrypt_authenticated_on(
+    curve: &Curve,
+    receiver_sec_key: &[u8; 32],
+    ciphertext_hex: &str,
+) -> Result<Vec<Fr254>, ZkKemDemError> {
+    if curve == &Curve::default_v1() {
+        let sk = BabyJubJubScalar::from_le_bytes_mod_order(receiver_sec_key);
+        if sk.is_zero() {
+            return Err(ZkKemDemError::RetryNeeded);
+        }
+        zk_kemdem_decrypt_authenticated(&sk, ciphertext_hex)
+    } else {
+        crate::runtime_kemdem::decrypt_authenticated(curve, receiver_sec_key, ciphertext_hex)
+    }
+}
+
+/// Derive a public key from a seed on the supplied curve. See
+/// [`generate_keypair_from_seed`].
+///
+/// Returns `(seed_le_bytes, pk_x, pk_y)`. For the default curve the
+/// returned seed bytes are the canonical little-endian encoding of
+/// the BabyJubJub-reduced scalar; for custom curves the returned
+/// bytes equal the supplied seed unchanged.
+pub fn generate_keypair_from_seed_on(
+    curve: &Curve,
+    seed: [u8; 32],
+) -> Result<([u8; 32], Fr254, Fr254), ZkKemDemError> {
+    if curve == &Curve::default_v1() {
+        let (sk, pk) = generate_keypair_from_seed(seed)?;
+        let mut sk_le = [0u8; 32];
+        let bytes = sk.into_bigint().to_bytes_le();
+        sk_le[..bytes.len()].copy_from_slice(&bytes);
+        Ok((sk_le, pk.x, pk.y))
+    } else {
+        crate::runtime_kemdem::keypair_from_seed(curve, &seed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,7 +1030,7 @@ mod tests {
         rng: &mut R,
     ) -> (BabyJubJubScalar, EdwardsAffine) {
         let sk = BabyJubJubScalar::rand(rng);
-        let pk = (EdwardsProjective::generator() * sk).into_affine();
+        let pk = (default_v1_generator() * sk).into_affine();
         (sk, pk)
     }
 
@@ -1068,8 +1226,7 @@ mod tests {
 
     #[test]
     fn domain_encrypt_zero_seed_returns_retry() {
-        use ark_ec::PrimeGroup;
-        let pk: EdwardsAffine = EdwardsProjective::generator().into_affine();
+        let pk = default_v1_generator();
         let payload = vec![Fr254::from(1u64)];
         let domains = test_domains();
         let err =
@@ -1266,4 +1423,191 @@ mod tests {
             "authenticated wire size must be (payload + 2 epk + 1 tag) * 32 * 2"
         );
     }
+
+    // ─── Default-curve byte-equivalence: *_on(default_v1, ...) ──
+
+    /// `zk_kemdem_encrypt_on(default_v1, seed, pk, payload)` must
+    /// produce a hex string identical to `zk_kemdem_encrypt(seed, pk,
+    /// payload)`. This pins the wire format so the runtime arithmetic
+    /// backend cannot drift bytes for the default curve.
+    #[test]
+    fn on_dispatcher_matches_legacy_encrypt_byte_for_byte() {
+        let curve = Curve::default_v1();
+        let (_, pk) = generate_keypair_from_seed([5u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..6).map(|i| Fr254::from(i as u64 * 31337 + 7)).collect();
+        let seed = [9u8; 32];
+
+        let legacy = zk_kemdem_encrypt(seed, &pk, &payload).unwrap();
+        let via_on = zk_kemdem_encrypt_on(&curve, seed, pk.x, pk.y, &payload).unwrap();
+        assert_eq!(legacy, via_on, "default-curve encrypt bytes must match legacy");
+    }
+
+    #[test]
+    fn on_dispatcher_matches_legacy_encrypt_authenticated_byte_for_byte() {
+        let curve = Curve::default_v1();
+        let (_, pk) = generate_keypair_from_seed([10u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..6).map(|i| Fr254::from(i as u64 * 1234 + 99)).collect();
+        let seed = [11u8; 32];
+
+        let legacy = zk_kemdem_encrypt_authenticated(seed, &pk, &payload).unwrap();
+        let via_on =
+            zk_kemdem_encrypt_authenticated_on(&curve, seed, pk.x, pk.y, &payload).unwrap();
+        assert_eq!(
+            legacy, via_on,
+            "default-curve authenticated-encrypt bytes must match legacy"
+        );
+    }
+
+    /// Helper: little-endian 32-byte encoding of a default-curve
+    /// secret key. Lets the cross-backend tests drive the new
+    /// `*_on` API (which takes `&[u8; 32]`) without re-deriving from
+    /// the seed.
+    fn sk_to_le32(sk: &BabyJubJubScalar) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let bytes = sk.into_bigint().to_bytes_le();
+        out[..bytes.len()].copy_from_slice(&bytes);
+        out
+    }
+
+    #[test]
+    fn on_dispatcher_decrypt_matches_legacy_decrypt() {
+        let curve = Curve::default_v1();
+        let (sk, pk) = generate_keypair_from_seed([12u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..4).map(|i| Fr254::from(i as u64 + 1)).collect();
+        let seed = [13u8; 32];
+
+        let ct = zk_kemdem_encrypt(seed, &pk, &payload).unwrap();
+        let legacy_pt = zk_kemdem_decrypt(&sk, &ct).unwrap();
+        let on_pt = zk_kemdem_decrypt_on(&curve, &sk_to_le32(&sk), &ct).unwrap();
+        assert_eq!(legacy_pt, payload);
+        assert_eq!(on_pt, payload);
+        assert_eq!(legacy_pt, on_pt);
+    }
+
+    #[test]
+    fn on_dispatcher_authenticated_decrypt_matches_legacy() {
+        let curve = Curve::default_v1();
+        let (sk, pk) = generate_keypair_from_seed([14u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..4).map(|i| Fr254::from(i as u64 + 100)).collect();
+        let seed = [15u8; 32];
+
+        let ct = zk_kemdem_encrypt_authenticated(seed, &pk, &payload).unwrap();
+        let legacy_pt = zk_kemdem_decrypt_authenticated(&sk, &ct).unwrap();
+        let on_pt =
+            zk_kemdem_decrypt_authenticated_on(&curve, &sk_to_le32(&sk), &ct).unwrap();
+        assert_eq!(legacy_pt, payload);
+        assert_eq!(on_pt, payload);
+        assert_eq!(legacy_pt, on_pt);
+    }
+
+    #[test]
+    fn on_dispatcher_keypair_matches_legacy() {
+        let curve = Curve::default_v1();
+        let seed = [16u8; 32];
+        let (legacy_sk, legacy_pk) = generate_keypair_from_seed(seed).unwrap();
+        let (on_sk_le, on_x, on_y) = generate_keypair_from_seed_on(&curve, seed).unwrap();
+        assert_eq!(sk_to_le32(&legacy_sk), on_sk_le);
+        assert_eq!(legacy_pk.x, on_x);
+        assert_eq!(legacy_pk.y, on_y);
+    }
+
+    /// Cross-backend round-trip on a *custom* curve: we build a
+    /// non-default curve (different cofactor, otherwise identical to
+    /// `default_v1`) and encrypt/decrypt through the runtime backend
+    /// end-to-end. The wire format and Poseidon stages are identical
+    /// to the typed path, so the test exercises every step of the
+    /// runtime arithmetic without relying on a separate parameter
+    /// set.
+    #[test]
+    fn on_dispatcher_runtime_path_roundtrips_on_custom_curve() {
+        // Custom curve: same parameters as default_v1 except cofactor.
+        // `Curve::new_validated` would reject it as not-equal to the
+        // built-in default if the gate were still in place, so this
+        // test also locks in that the gate is gone.
+        let mut custom = Curve::default_v1();
+        custom.cofactor = 16;
+
+        // Encrypt/decrypt seeds — these are raw 32-byte buffers in
+        // the curve-generic API.
+        let recv_seed = [21u8; 32];
+        let enc_seed = [22u8; 32];
+
+        // Derive a receiver keypair on the custom curve via the
+        // runtime path so the public key is guaranteed to be on the
+        // (custom) curve and in its prime-order subgroup.
+        let (sk_le, pk_x, pk_y) = generate_keypair_from_seed_on(&custom, recv_seed).unwrap();
+        assert_eq!(sk_le, recv_seed, "runtime path returns the supplied seed verbatim");
+
+        let payload: Vec<Fr254> =
+            (0..5).map(|i| Fr254::from(0xDEAD_BEEF_u64 + i as u64)).collect();
+
+        // Unauthenticated round-trip.
+        let ct = zk_kemdem_encrypt_on(&custom, enc_seed, pk_x, pk_y, &payload).unwrap();
+        let pt = zk_kemdem_decrypt_on(&custom, &sk_le, &ct).unwrap();
+        assert_eq!(pt, payload);
+
+        // Authenticated round-trip.
+        let ct_a =
+            zk_kemdem_encrypt_authenticated_on(&custom, enc_seed, pk_x, pk_y, &payload)
+                .unwrap();
+        let pt_a = zk_kemdem_decrypt_authenticated_on(&custom, &sk_le, &ct_a).unwrap();
+        assert_eq!(pt_a, payload);
+    }
+
+    /// Cross-backend byte-equivalence on the default curve when the
+    /// dispatcher is forced through the runtime path. We can't ask
+    /// the dispatcher itself to take this branch (it special-cases
+    /// `default_v1`), so we call `runtime_kemdem` directly. The
+    /// output must match the legacy typed path bit-for-bit, proving
+    /// the runtime backend is a faithful reimplementation rather
+    /// than an independent (potentially-divergent) protocol.
+    #[test]
+    fn cross_backend_default_curve_runtime_matches_typed_byte_for_byte() {
+        let curve = Curve::default_v1();
+        let (_, pk) = generate_keypair_from_seed([30u8; 32]).unwrap();
+        let payload: Vec<Fr254> = (0..7).map(|i| Fr254::from(i as u64 * 271 + 1)).collect();
+        let seed = [31u8; 32];
+
+        // Typed (legacy) path.
+        let typed = zk_kemdem_encrypt(seed, &pk, &payload).unwrap();
+        // Runtime path, same default curve.
+        let runtime =
+            crate::runtime_kemdem::encrypt(&curve, &seed, pk.x, pk.y, &payload).unwrap();
+        assert_eq!(typed, runtime, "runtime backend must produce identical bytes on default_v1");
+
+        // Same check for authenticated.
+        let typed_a = zk_kemdem_encrypt_authenticated(seed, &pk, &payload).unwrap();
+        let runtime_a =
+            crate::runtime_kemdem::encrypt_authenticated(&curve, &seed, pk.x, pk.y, &payload)
+                .unwrap();
+        assert_eq!(
+            typed_a, runtime_a,
+            "runtime authenticated encrypt must produce identical bytes on default_v1"
+        );
+    }
+
+    /// Authenticated MAC tampering must be rejected on the runtime
+    /// path too — flips a single ciphertext byte and confirms the
+    /// runtime decrypt returns `MacMismatch`.
+    #[test]
+    fn runtime_path_rejects_tampered_authenticated_ciphertext() {
+        let mut custom = Curve::default_v1();
+        custom.cofactor = 16;
+
+        let (sk_le, pk_x, pk_y) =
+            generate_keypair_from_seed_on(&custom, [40u8; 32]).unwrap();
+        let payload = vec![Fr254::from(7u64), Fr254::from(8u64)];
+        let ct =
+            zk_kemdem_encrypt_authenticated_on(&custom, [41u8; 32], pk_x, pk_y, &payload)
+                .unwrap();
+
+        // Flip a byte in the first ct element.
+        let mut bytes = hex::decode(&ct).unwrap();
+        bytes[0] ^= 0x01;
+        let tampered = hex::encode(&bytes);
+
+        let err = zk_kemdem_decrypt_authenticated_on(&custom, &sk_le, &tampered).unwrap_err();
+        assert_eq!(err, ZkKemDemError::MacMismatch);
+    }
 }
+

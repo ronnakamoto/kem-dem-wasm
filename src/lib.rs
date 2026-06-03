@@ -34,17 +34,21 @@
 #![deny(unused_must_use, unreachable_patterns, rust_2018_idioms)]
 #![warn(clippy::all)]
 
+pub mod curve;
 mod derive;
 mod error;
 mod hex_util;
 mod hpke_api;
 mod kem;
 pub mod kemdem_functions;
+mod runtime_kemdem;
+mod te_arith;
 mod zk_api;
 
 // Re-export the WASM-facing types at the crate root so `wasm-bindgen`
 // keeps emitting them under their existing JS names — splitting the
 // implementation across modules must not change the public API.
+pub use curve::ZkCurve;
 pub use hpke_api::{
     EncryptedBlob, EncryptedPackage, KemDem, KeyPair, MAX_FIELD_COUNT, MAX_FIELD_VALUE_LEN,
 };
