@@ -29,7 +29,7 @@
 //! ciphertexts stay byte-identical.
 
 use ark_bn254::Fr as Fr254;
-use ark_ff::{BigInteger, BigInteger256, Field, LegendreSymbol, One, Zero};
+use ark_ff::{BigInteger, BigInteger256, Field, LegendreSymbol, One, PrimeField, Zero};
 use std::fmt;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
@@ -297,6 +297,49 @@ impl ZkCurve {
     #[wasm_bindgen(getter)]
     pub fn gy(&self) -> String {
         crate::hex_util::fr_to_be_hex(&self.inner.gy)
+    }
+
+    /// Recovers the `x` coordinate of a point on this curve from its `y`
+    /// coordinate and a sign bit, using the curve equation:
+    /// `a * x^2 + y^2 = 1 + d * x^2 * y^2`.
+    ///
+    /// The `sign` bit follows the `arkworks` convention: `true` means
+    /// `x > (p - 1) / 2`.
+    /// 
+    /// Returns the 0x-prefixed BE hex string of `x`, or throws an error
+    /// if `y` does not correspond to a valid point.
+    #[wasm_bindgen(js_name = recoverX)]
+    pub fn recover_x(&self, y_be_hex: &str, sign: bool) -> Result<String, JsValue> {
+        let y = parse_fr_be_labeled(y_be_hex, "y").map_err(js_err)?;
+
+        // x^2 = (1 - y^2) / (a - d * y^2)
+        let y2 = y.square();
+        let num = Fr254::one() - y2;
+        let den = self.inner.a - (self.inner.d * y2);
+
+        if den.is_zero() {
+            if num.is_zero() {
+                // (0, 1) or (0, -1) depending on a and d, but typically handled cleanly
+                if sign {
+                    return Err(js_err("Invalid sign for x=0".to_string()));
+                }
+                return Ok(crate::hex_util::fr_to_be_hex(&Fr254::zero()));
+            } else {
+                return Err(js_err("Division by zero: no valid x for this y".to_string()));
+            }
+        }
+
+        let x2 = num * den.inverse().unwrap();
+        let mut x = x2.sqrt().ok_or_else(|| js_err("No square root exists: y is not on the curve"))?;
+
+        // Determine sign based on arkworks convention: sign bit represents x > (p-1)/2
+        let p_minus_one_div_two = <Fr254 as ark_ff::PrimeField>::MODULUS_MINUS_ONE_DIV_TWO;
+        let x_is_neg = x.into_bigint() > p_minus_one_div_two;
+        if x_is_neg != sign {
+            x = -x;
+        }
+
+        Ok(crate::hex_util::fr_to_be_hex(&x))
     }
 }
 

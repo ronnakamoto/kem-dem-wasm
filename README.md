@@ -468,6 +468,32 @@ const pt = ZkEncryptor.decryptWithDomains(
 )
 ```
 
+> **Note**: The decrypt functions handle EPK decompression internally. If you need to recover `x` from a compressed point *outside* the encrypt/decrypt flow (e.g., reading a compressed public key from on-chain storage), use `ZkCurve.recoverX()` — see [Point Decompression](#point-decompression-recoverx) below.
+
+#### Point Decompression (`recoverX`)
+
+`ZkCurve.recoverX(y_hex, sign)` recovers the `x` coordinate of a point on the curve from its `y` coordinate and a sign bit, using the curve equation `a·x² + y² = 1 + d·x²·y²`.
+
+The `sign` parameter follows the arkworks convention: `true` means `x > (p - 1) / 2` (i.e., `x` is in the upper half of the field). This matches the sign flag produced by `compress_epk = true`.
+
+```javascript
+import { ZkCurve } from 'kem-dem-wasm'
+
+const curve = ZkCurve.defaultV1()
+
+// Given a compressed point (y coordinate + sign bit from on-chain data)
+const y    = '0x2df7db445a6c4b2b3504104597b83f3d790d96d741c8888b1d1cd780ebbd2f17'
+const sign = false  // sign bit: true if x > (p-1)/2, false otherwise
+
+const x = curve.recoverX(y, sign)
+// x → "0x..." (0x-prefixed 64-char BE hex)
+```
+
+Throws if:
+- `y` does not correspond to any point on the curve (no square root exists)
+- The denominator `a - d·y²` is zero with a non-zero numerator
+- `sign` is `true` but the only valid `x` is zero
+
 ### Use Cases
 
 - **Private voting**: Encrypt votes as Fr elements, prove correctness in a SNARK without revealing plaintext
